@@ -6275,23 +6275,46 @@ removeUser() {
 }
 # 更新脚本
 updateV2RayAgent() {
+    local repository=${V2RAY_AGENT_REPOSITORY:-ECHOAPi/v2ray-agent}
+    local branch=${V2RAY_AGENT_BRANCH:-master}
+    local installDir=/etc/v2ray-agent
+    local installScript=${installDir}/install.sh
+    local tempScript downloadURL version
+
     echoContent skyBlue "\n进度  $1/${totalProgress} : 更新v2ray-agent脚本"
-    rm -rf /etc/v2ray-agent/install.sh
-    if [[ "${release}" == "alpine" ]]; then
-        wget -c -q -P /etc/v2ray-agent/ -N --no-check-certificate "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh"
-    else
-        wget -c -q "${wgetShowProgressStatus}" -P /etc/v2ray-agent/ -N --no-check-certificate "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh"
+    if [[ ! ${repository} =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+        echoContent red " ---> 脚本仓库格式错误"
+        return 1
+    fi
+    if [[ ! ${branch} =~ ^[A-Za-z0-9._/-]+$ || ${branch} == *..* ]]; then
+        echoContent red " ---> 脚本分支格式错误"
+        return 1
     fi
 
-    sudo chmod 700 /etc/v2ray-agent/install.sh
-    local version
-    version=$(grep '当前版本：v' "/etc/v2ray-agent/install.sh" | awk -F "[v]" '{print $2}' | tail -n +2 | head -n 1 | awk -F "[\"]" '{print $1}')
+    mkdir -p "${installDir}"
+    tempScript=$(mktemp "${installDir}/install.sh.tmp.XXXXXX") || return 1
+    downloadURL="https://raw.githubusercontent.com/${repository}/${branch}/install.sh"
+    if ! wget -q -O "${tempScript}" "${downloadURL}" ||
+        ! /bin/bash -n "${tempScript}"; then
+        rm -f -- "${tempScript}"
+        echoContent red " ---> 下载或校验更新脚本失败，现有脚本保持不变"
+        return 1
+    fi
+    chmod 700 "${tempScript}" || {
+        rm -f -- "${tempScript}"
+        return 1
+    }
+    mv -f -- "${tempScript}" "${installScript}" || {
+        rm -f -- "${tempScript}"
+        return 1
+    }
+    version=$(grep '当前版本：v' "${installScript}" | awk -F "[v]" '{print $2}' | tail -n +2 | head -n 1 | awk -F "[\"]" '{print $1}')
 
     echoContent green "\n ---> 更新完毕"
     echoContent yellow " ---> 请手动执行[vasma]打开脚本"
     echoContent green " ---> 当前版本：${version}\n"
     echoContent yellow "如更新不成功，请手动执行下面命令\n"
-    echoContent skyBlue "wget -P /root -N --no-check-certificate https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh && chmod 700 /root/install.sh && /root/install.sh"
+    echoContent skyBlue "wget -O /root/install.sh ${downloadURL} && chmod 700 /root/install.sh && /root/install.sh"
     echo
     exit 0
 }
@@ -8732,7 +8755,7 @@ cronFunction() {
 }
 # 端口流量监控
 trafficMonitorManage() {
-    local repository=${V2RAY_AGENT_REPOSITORY:-mack-a/v2ray-agent}
+    local repository=${V2RAY_AGENT_REPOSITORY:-ECHOAPi/v2ray-agent}
     local branch=${V2RAY_AGENT_BRANCH:-master}
     local trafficMonitorDir=/etc/v2ray-agent/traffic
     local trafficMonitorScript=${trafficMonitorDir}/traffic_monitor.sh
@@ -8754,10 +8777,14 @@ trafficMonitorManage() {
     downloadURL="https://raw.githubusercontent.com/${repository}/${branch}/shell/traffic_monitor.sh"
 
     if wget -q -O "${tempScript}" "${downloadURL}" && /bin/bash -n "${tempScript}"; then
-        chmod 700 "${tempScript}"
-        mv -f "${tempScript}" "${trafficMonitorScript}"
+        if ! chmod 700 "${tempScript}" ||
+            ! mv -f -- "${tempScript}" "${trafficMonitorScript}"; then
+            rm -f -- "${tempScript}"
+            echoContent red " ---> 安装端口流量监控组件失败"
+            return 1
+        fi
     else
-        rm -f "${tempScript}"
+        rm -f -- "${tempScript}"
         if [[ ! -x "${trafficMonitorScript}" ]]; then
             echoContent red " ---> 端口流量监控组件下载或校验失败"
             return

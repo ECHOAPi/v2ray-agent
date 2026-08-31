@@ -20,7 +20,6 @@ XRAY_CONF_DIR=${V2RAY_AGENT_XRAY_CONF_DIR:-${AGENT_DIR}/xray/conf}
 SING_BOX_BIN=${V2RAY_AGENT_SING_BOX_BIN:-${AGENT_DIR}/sing-box/sing-box}
 SING_BOX_CONF=${V2RAY_AGENT_SING_BOX_CONF:-${AGENT_DIR}/sing-box/conf/config.json}
 
-XRAY_POLICY_FILE=${XRAY_CONF_DIR}/12_policy.json
 XRAY_ROUTING_FILE=${XRAY_CONF_DIR}/09_routing.json
 XRAY_STATS_FILE=${XRAY_CONF_DIR}/13_traffic_stats.json
 XRAY_BLOCK_OUTBOUND_FILE=${XRAY_CONF_DIR}/08_traffic_block_outbound.json
@@ -318,13 +317,14 @@ valid_stats_response() {
         and all(.stat[]?;
             (.name | type) == "string"
             and (
-                (.value | type) == "number"
+                .value == null
+                or (.value | type) == "number"
                 or (
                     (.value | type) == "string"
                     and (.value | test("^[0-9]+$"))
                 )
             )
-            and ((.value | tonumber) >= 0)
+            and (((.value // 0) | tonumber) >= 0)
         )
     ' >/dev/null 2>&1
 }
@@ -342,7 +342,7 @@ aggregate_stats() {
         | (reduce (
             .stat[]?
             | select(.name | test("^inbound>>>.*>>>traffic>>>(uplink|downlink)$"))
-          ) as $stat ({}; .[$stat.name] = ($stat.value | tonumber))) as $counters
+          ) as $stat ({}; .[$stat.name] = (($stat.value // 0) | tonumber))) as $counters
         | (reduce ($counters | to_entries[]) as $counter ({};
             ($counter.key
              | capture("^inbound>>>(?<tag>.*)>>>traffic>>>(?<direction>uplink|downlink)$").tag
@@ -822,38 +822,94 @@ sync_xray_config() {
 }
 
 remove_managed_xray_config() {
-    local temp_file changed=false
+    local temp_dir backup_dir file relative changed=false apply_failed=false
     [[ -d "${XRAY_CONF_DIR}" ]] || return 0
-    if [[ -f "${XRAY_ROUTING_FILE}" ]]; then
-        temp_file=$(mktemp "${XRAY_ROUTING_FILE}.tmp.XXXXXX") || return 1
+
+    temp_dir=$(mktemp -d "${TRAFFIC_DIR}/xray-remove.XXXXXX") || return 1
+    for file in "${XRAY_CONF_DIR}"/*.json; do
+        [[ -f "${file}" ]] || continue
+        cp -- "${file}" "${temp_dir}/" || {
+            rm -rf -- "${temp_dir}"
+            return 1
+        }
+    done
+
+    if [[ -f "${temp_dir}/09_routing.json" ]]; then
         jq --arg tag "${MANAGED_BLOCK_TAG}" --arg legacy "${LEGACY_BLOCK_TAG}" '
             .routing.rules = ([
                 .routing.rules[]?
                 | select(.outboundTag != $tag and .outboundTag != $legacy)
             ])
-        ' "${XRAY_ROUTING_FILE}" >"${temp_file}" || {
-            rm -f -- "${temp_file}"
+        ' "${temp_dir}/09_routing.json" >"${temp_dir}/09_routing.json.new" || {
+            rm -rf -- "${temp_dir}"
             return 1
         }
-        if ! cmp -s "${temp_file}" "${XRAY_ROUTING_FILE}"; then
-            chmod 644 "${temp_file}"
-            mv -f -- "${temp_file}" "${XRAY_ROUTING_FILE}"
+        mv -f -- "${temp_dir}/09_routing.json.new" "${temp_dir}/09_routing.json"
+    fi
+    rm -f -- "${temp_dir}/13_traffic_stats.json" \
+        "${temp_dir}/08_traffic_block_outbound.json"
+
+    if [[ ${TEST_MODE} != 1 && -x "${XRAY_BIN}" ]] &&
+        ! "${XRAY_BIN}" run -test -confdir "${temp_dir}" >/dev/null 2>&1; then
+        rm -rf -- "${temp_dir}"
+        die "移除监控配置后的 Xray 校验失败，原配置未改动"
+        return 1
+    fi
+
+    backup_dir=$(mktemp -d "${TRAFFIC_DIR}/xray-backup.XXXXXX") || {
+        rm -rf -- "${temp_dir}"
+        return 1
+    }
+    if ! snapshot_xray_files "${backup_dir}"; then
+        rm -rf -- "${temp_dir}" "${backup_dir}"
+        die "无法创建 Xray 配置快照，原配置未改动"
+        return 1
+    fi
+
+    relative=09_routing.json
+    if [[ -f "${temp_dir}/${relative}" ]] &&
+        { [[ ! -f "${XRAY_CONF_DIR}/${relative}" ]] ||
+          ! cmp -s "${temp_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}"; }; then
+        if atomic_copy "${temp_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}" 644; then
             changed=true
         else
-            rm -f -- "${temp_file}"
+            apply_failed=true
         fi
     fi
-    if [[ -f "${XRAY_STATS_FILE}" ]]; then
-        rm -f -- "${XRAY_STATS_FILE}"
-        changed=true
+
+    if [[ ${apply_failed} == false ]]; then
+        for relative in 13_traffic_stats.json 08_traffic_block_outbound.json; do
+            if [[ -f "${XRAY_CONF_DIR}/${relative}" ]]; then
+                if rm -f -- "${XRAY_CONF_DIR}/${relative}"; then
+                    changed=true
+                else
+                    apply_failed=true
+                    break
+                fi
+            fi
+        done
     fi
-    if [[ -f "${XRAY_BLOCK_OUTBOUND_FILE}" ]]; then
-        rm -f -- "${XRAY_BLOCK_OUTBOUND_FILE}"
-        changed=true
+
+    if [[ ${apply_failed} == true ]]; then
+        restore_xray_files "${backup_dir}" || true
+        rm -rf -- "${temp_dir}" "${backup_dir}"
+        die "移除 Xray 监控配置失败，已尝试恢复原配置"
+        return 1
     fi
-    if [[ ${changed} == true ]]; then
-        restart_xray
+
+    if [[ ${changed} == true ]] && ! restart_xray; then
+        if restore_xray_files "${backup_dir}"; then
+            restart_xray >/dev/null 2>&1 || true
+            rm -rf -- "${temp_dir}" "${backup_dir}"
+            die "Xray 重启失败，已恢复修改前的配置"
+        else
+            rm -rf -- "${temp_dir}" "${backup_dir}"
+            die "Xray 重启失败，且自动恢复配置未完全成功"
+        fi
+        return 1
     fi
+
+    rm -rf -- "${temp_dir}" "${backup_dir}"
 }
 
 cleanup_collect_lock() {
@@ -1066,7 +1122,7 @@ remove_cron() {
 }
 
 enable_monitor() {
-    local allow_partial=${1:-false}
+    local allow_partial=${1:-false} previous_config previous_enabled rollback_failed=false
     ensure_storage || return 1
     if [[ ! -x "${XRAY_BIN}" || ! -d "${XRAY_CONF_DIR}" ]]; then
         if [[ -x "${SING_BOX_BIN}" ]]; then
@@ -1077,17 +1133,44 @@ enable_monitor() {
         return 1
     fi
     if [[ -f "${SING_BOX_CONF}" && ${allow_partial} != true ]]; then
-        die "检测到同时运行的 sing-box 协议；请显式选择“仅监控 Xray 端口”后继续"
+        die '检测到同时运行的 sing-box 协议；请显式选择“仅监控 Xray 端口”后继续'
         return 1
     fi
 
+    if ! acquire_collect_lock; then
+        die "已有采集或配置操作正在执行，请稍后重试"
+        return 1
+    fi
+    trap cleanup_collect_lock EXIT
+    trap 'cleanup_collect_lock; exit 130' INT
+    trap 'cleanup_collect_lock; exit 143' TERM
+    previous_config=$(command cat "${CONFIG_FILE}")
+    previous_enabled=$(jq -r '.enabled // false' <<<"${previous_config}")
     jq '.enabled = true | .core = "xray"' "${CONFIG_FILE}" |
-        atomic_json_write "${CONFIG_FILE}" || return 1
+        atomic_json_write "${CONFIG_FILE}" || {
+            release_collect_lock
+            return 1
+        }
     sync_xray_config || {
-        jq '.enabled = false' "${CONFIG_FILE}" | atomic_json_write "${CONFIG_FILE}"
+        printf '%s' "${previous_config}" | atomic_json_write "${CONFIG_FILE}" || true
+        release_collect_lock
         return 1
     }
-    install_cron
+    if ! install_cron; then
+        printf '%s' "${previous_config}" | atomic_json_write "${CONFIG_FILE}" ||
+            rollback_failed=true
+        if [[ ${previous_enabled} != true ]]; then
+            remove_managed_xray_config || rollback_failed=true
+        fi
+        release_collect_lock
+        if [[ ${rollback_failed} == true ]]; then
+            die "安装定时任务失败，且启用状态未能完全回滚"
+            return 1
+        fi
+        die "安装定时任务失败"
+        return 1
+    fi
+    release_collect_lock
     say "${green} ---> 端口流量监控已启用${plain}"
     if [[ -f "${SING_BOX_CONF}" ]]; then
         say "${yellow} ---> 当前只统计 Xray 入站端口，sing-box 端口不会计入额度${plain}"
@@ -1098,14 +1181,61 @@ enable_monitor() {
 }
 
 disable_monitor() {
+    local previous_config rollback_failed=false
     ensure_storage || return 1
-    jq '.enabled = false' "${CONFIG_FILE}" | atomic_json_write "${CONFIG_FILE}" || return 1
-    remove_cron
+    if ! acquire_collect_lock; then
+        die "已有采集或配置操作正在执行，请稍后重试"
+        return 1
+    fi
+    trap cleanup_collect_lock EXIT
+    trap 'cleanup_collect_lock; exit 130' INT
+    trap 'cleanup_collect_lock; exit 143' TERM
+    previous_config=$(command cat "${CONFIG_FILE}")
+    jq '.enabled = false' "${CONFIG_FILE}" | atomic_json_write "${CONFIG_FILE}" || {
+        release_collect_lock
+        return 1
+    }
+    if ! remove_cron; then
+        printf '%s' "${previous_config}" | atomic_json_write "${CONFIG_FILE}" || true
+        release_collect_lock
+        die "移除定时任务失败"
+        return 1
+    fi
     if ! remove_managed_xray_config; then
+        printf '%s' "${previous_config}" | atomic_json_write "${CONFIG_FILE}" ||
+            rollback_failed=true
+        if [[ $(jq -r '.enabled // false' <<<"${previous_config}") == true ]]; then
+            install_cron || rollback_failed=true
+        fi
+        release_collect_lock
+        if [[ ${rollback_failed} == true ]]; then
+            die "移除核心配置失败，且监控状态未能完全恢复"
+            return 1
+        fi
         die "移除端口流量监控核心配置失败，请检查 Xray 配置"
         return 1
     fi
+    release_collect_lock
     say "${green} ---> 端口流量监控已停用，历史数据已保留，端口限制已解除${plain}"
+}
+
+sync_config_command() {
+    local result=0
+    ensure_storage || return 1
+    if ! acquire_collect_lock; then
+        die "已有采集或配置操作正在执行，请稍后重试"
+        return 1
+    fi
+    trap cleanup_collect_lock EXIT
+    trap 'cleanup_collect_lock; exit 130' INT
+    trap 'cleanup_collect_lock; exit 143' TERM
+    if config_enabled; then
+        sync_xray_config || result=$?
+    else
+        remove_managed_xray_config || result=$?
+    fi
+    release_collect_lock
+    return "${result}"
 }
 
 display_usage() {
@@ -1542,10 +1672,7 @@ main() {
     enable) enable_monitor "${2:-false}" ;;
     disable) disable_monitor ;;
     collect) collect ;;
-    sync-config)
-        ensure_storage || return 1
-        if config_enabled; then sync_xray_config; else remove_managed_xray_config; fi
-        ;;
+    sync-config) sync_config_command ;;
     view) display_usage ;;
     report) generate_report "${2:-daily}" "${3:-current}" "${4:-false}" ;;
     doctor) doctor ;;

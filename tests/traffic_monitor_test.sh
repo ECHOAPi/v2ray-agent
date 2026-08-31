@@ -143,6 +143,23 @@ jq '
 ' "${TRAFFIC_DIR}/config.json" >"${config_tmp}"
 mv "${config_tmp}" "${TRAFFIC_DIR}/config.json"
 
+# Xray's JSON output omits protobuf scalar values when a counter is zero.
+STATS_FILE=${TEST_ROOT}/stats-omitted-zero.json
+jq -n '{
+    stat: [
+        {name: "inbound>>>VLESSTCP>>>traffic>>>uplink"},
+        {name: "inbound>>>VLESSTCP>>>traffic>>>downlink"},
+        {name: "inbound>>>VMessWS>>>traffic>>>uplink"},
+        {name: "inbound>>>VMessWS>>>traffic>>>downlink"},
+        {name: "inbound>>>ADMIN>>>traffic>>>uplink"}
+    ]
+}' >"${STATS_FILE}"
+run_monitor collect
+assert_jq "${TRAFFIC_DIR}/state.json" '
+    .ports["443"].total == 0
+    and .core_counters["inbound>>>VLESSTCP>>>traffic>>>uplink"] == 0
+' 'omitted zero-valued protobuf counters were rejected or miscounted'
+
 # 80% threshold: aggregate every Xray inbound tag that listens on port 443.
 STATS_FILE=${TEST_ROOT}/stats-threshold.json
 write_stats "${STATS_FILE}" 400 400 400 400 100
@@ -344,6 +361,56 @@ doctor_output=$(run_monitor doctor)
 grep -q '自检通过' <<<"${doctor_output}" || {
     printf '%s\n' "${doctor_output}" >&2
     fail 'doctor command did not pass a consistent monitored state'
+}
+
+# A live collector lock prevents an interactive disable from racing config writes.
+mkdir "${TRAFFIC_DIR}/collect.lock"
+printf '%s\n' "$$" >"${TRAFFIC_DIR}/collect.lock/pid"
+if run_monitor disable >/dev/null 2>&1; then
+    fail 'disable ignored a live collection lock'
+fi
+assert_jq "${TRAFFIC_DIR}/config.json" '.enabled == true' \
+    'busy disable changed monitor state'
+rm -f "${TRAFFIC_DIR}/collect.lock/pid"
+rmdir "${TRAFFIC_DIR}/collect.lock"
+
+# Disabling is transactional: a failed restart restores files and enabled state.
+cp "${TRAFFIC_DIR}/config.json" "${TEST_ROOT}/config-before-disable.json"
+cp "${XRAY_CONF_DIR}/09_routing.json" "${TEST_ROOT}/routing-before-disable.json"
+cp "${XRAY_CONF_DIR}/13_traffic_stats.json" "${TEST_ROOT}/stats-before-disable.json"
+cp "${XRAY_CONF_DIR}/08_traffic_block_outbound.json" \
+    "${TEST_ROOT}/outbound-before-disable.json"
+V2RAY_AGENT_TEST_RESTART_FAIL=1
+if run_monitor disable >/dev/null 2>&1; then
+    fail 'disable unexpectedly succeeded after a simulated Xray restart failure'
+fi
+unset V2RAY_AGENT_TEST_RESTART_FAIL
+cmp -s "${TEST_ROOT}/config-before-disable.json" \
+    "${TRAFFIC_DIR}/config.json" || fail 'failed disable did not restore monitor config'
+cmp -s "${TEST_ROOT}/routing-before-disable.json" \
+    "${XRAY_CONF_DIR}/09_routing.json" || fail 'failed disable did not restore routing config'
+cmp -s "${TEST_ROOT}/stats-before-disable.json" \
+    "${XRAY_CONF_DIR}/13_traffic_stats.json" || fail 'failed disable did not restore StatsService config'
+cmp -s "${TEST_ROOT}/outbound-before-disable.json" \
+    "${XRAY_CONF_DIR}/08_traffic_block_outbound.json" || fail 'failed disable did not restore blackhole outbound'
+assert_no_file "${TRAFFIC_DIR}/collect.lock"
+
+# A successful disable removes only managed files and leaves a clean state.
+run_monitor disable >/dev/null
+assert_jq "${TRAFFIC_DIR}/config.json" '.enabled == false' \
+    'successful disable did not persist disabled state'
+assert_no_file "${XRAY_CONF_DIR}/13_traffic_stats.json"
+assert_no_file "${XRAY_CONF_DIR}/08_traffic_block_outbound.json"
+assert_jq "${XRAY_CONF_DIR}/09_routing.json" '
+    [.routing.rules[] | select(
+        .outboundTag == "v2ray-agent-traffic-block"
+        or .outboundTag == "traffic-block"
+    )] | length == 0
+' 'successful disable left a managed blackhole rule'
+doctor_disabled_output=$(run_monitor doctor)
+grep -q '自检通过' <<<"${doctor_disabled_output}" || {
+    printf '%s\n' "${doctor_disabled_output}" >&2
+    fail 'doctor did not validate the disabled state after cleanup'
 }
 
 printf 'PASS: port traffic monitor tests\n'
