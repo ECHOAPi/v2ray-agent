@@ -120,7 +120,9 @@ ensure_storage() {
         normalized=$(jq '
             .version = 2
             | .coverage = "xray-ports"
-            | .ports = (.ports // {})
+            | .ports = (
+                if (.ports | type) == "object" then .ports else {} end
+              )
             | del(.users)
         ' "${CONFIG_FILE}") || return 1
         printf '%s' "${normalized}" |
@@ -309,10 +311,29 @@ query_xray_stats() {
     "${XRAY_BIN}" api statsquery --server="${api}" -pattern 'inbound>>>'
 }
 
+valid_stats_response() {
+    local raw_stats=$1
+    printf '%s' "${raw_stats}" | jq -e '
+        (.stat | type) == "array"
+        and all(.stat[]?;
+            (.name | type) == "string"
+            and (
+                (.value | type) == "number"
+                or (
+                    (.value | type) == "string"
+                    and (.value | test("^[0-9]+$"))
+                )
+            )
+            and ((.value | tonumber) >= 0)
+        )
+    ' >/dev/null 2>&1
+}
+
 aggregate_stats() {
     local raw_stats=$1
     local inbounds=$2
     local previous_counters
+    valid_stats_response "${raw_stats}" || return 1
     previous_counters=$(jq '.core_counters // {}' "${STATE_FILE}")
     printf '%s' "${raw_stats}" | jq \
         --argjson inbounds "${inbounds}" \
@@ -335,7 +356,14 @@ aggregate_stats() {
                 .[$port] = ((.[$port] // 0) + $delta)
               else . end
           )) as $deltas
-        | {counters: $counters, deltas: $deltas}
+        | {
+            counters: (
+                ($previous | with_entries(
+                    select(.key | test("^inbound>>>.*>>>traffic>>>(uplink|downlink)$"))
+                )) + $counters
+            ),
+            deltas: $deltas
+          }
     '
 }
 
@@ -470,7 +498,14 @@ update_state() {
                 percent: $percent,
                 stage: (if .used >= .limit then "limit" else "threshold" end)
               }
-            | .id = ([.port, .period, .key, .stage] | join("|"))
+            | .id = ([
+                .port,
+                .period,
+                .key,
+                .stage,
+                (.limit | tostring),
+                (($config.alert_percent // 80) | tostring)
+              ] | join("|"))
             | select(($next.alerts[.id] // 0) == 0)
           ] as $quota_events
         | [
@@ -560,9 +595,9 @@ dispatch_events() {
                     elif . == "total" then "累计"
                     else . end
                 ) | join("、")' <<<"${event}")
-                message="[v2ray-agent] 端口 ${port} 已因流量超额自动停用（${reasons}）"
+                message="[v2ray-agent] 端口 ${port} 已因流量超额启用黑洞停用（${reasons}）"
             else
-                message="[v2ray-agent] 端口 ${port} 的结算周期已重置，端口已自动恢复"
+                message="[v2ray-agent] 端口 ${port} 的额度状态已恢复，黑洞规则已自动移除"
             fi
             notify_message status "${message}"
             continue
@@ -584,7 +619,11 @@ dispatch_events() {
 }
 
 restart_xray() {
-    if [[ ${TEST_MODE} == 1 || ${V2RAY_AGENT_NO_RESTART:-0} == 1 ]]; then
+    if [[ ${TEST_MODE} == 1 ]]; then
+        [[ ${V2RAY_AGENT_TEST_RESTART_FAIL:-0} != 1 ]]
+        return
+    fi
+    if [[ ${V2RAY_AGENT_NO_RESTART:-0} == 1 ]]; then
         return 0
     fi
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet xray.service; then
@@ -596,9 +635,46 @@ restart_xray() {
     fi
 }
 
+snapshot_xray_files() {
+    local backup_dir=$1
+    local relative
+    mkdir -p "${backup_dir}" || return 1
+    for relative in \
+        12_policy.json \
+        09_routing.json \
+        13_traffic_stats.json \
+        08_traffic_block_outbound.json; do
+        if [[ -f "${XRAY_CONF_DIR}/${relative}" ]]; then
+            cp -- "${XRAY_CONF_DIR}/${relative}" "${backup_dir}/${relative}" || return 1
+        else
+            : >"${backup_dir}/missing-${relative}" || return 1
+        fi
+    done
+}
+
+restore_xray_files() {
+    local backup_dir=$1
+    local relative failed=false
+    for relative in \
+        12_policy.json \
+        09_routing.json \
+        13_traffic_stats.json \
+        08_traffic_block_outbound.json; do
+        if [[ -f "${backup_dir}/${relative}" ]]; then
+            atomic_copy "${backup_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}" 644 ||
+                failed=true
+        elif [[ -f "${backup_dir}/missing-${relative}" ]]; then
+            rm -f -- "${XRAY_CONF_DIR}/${relative}" || failed=true
+        else
+            failed=true
+        fi
+    done
+    [[ ${failed} == false ]]
+}
+
 sync_xray_config() {
-    local temp_dir inbounds disabled_ports blocked_tags api changed=false
-    local file relative
+    local temp_dir backup_dir inbounds disabled_ports blocked_tags api changed=false
+    local file relative apply_failed=false
 
     ensure_storage || return 1
     [[ -d "${XRAY_CONF_DIR}" ]] || return 0
@@ -686,35 +762,63 @@ sync_xray_config() {
         fi
     fi
 
+    backup_dir=$(mktemp -d "${TRAFFIC_DIR}/xray-backup.XXXXXX") || {
+        rm -rf -- "${temp_dir}"
+        return 1
+    }
+    if ! snapshot_xray_files "${backup_dir}"; then
+        rm -rf -- "${temp_dir}" "${backup_dir}"
+        die "无法创建 Xray 配置快照，原配置未改动"
+        return 1
+    fi
+
     for relative in 12_policy.json 09_routing.json 13_traffic_stats.json; do
         if [[ ! -f "${XRAY_CONF_DIR}/${relative}" ]] ||
             ! cmp -s "${temp_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}"; then
-            atomic_copy "${temp_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}" 644 || {
-                rm -rf -- "${temp_dir}"
-                return 1
-            }
+            if ! atomic_copy "${temp_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}" 644; then
+                apply_failed=true
+                break
+            fi
             changed=true
         fi
     done
-    relative=08_traffic_block_outbound.json
-    if [[ -f "${temp_dir}/${relative}" ]]; then
-        if [[ ! -f "${XRAY_CONF_DIR}/${relative}" ]] ||
-            ! cmp -s "${temp_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}"; then
-            atomic_copy "${temp_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}" 644 || {
-                rm -rf -- "${temp_dir}"
-                return 1
-            }
+
+    if [[ ${apply_failed} == false ]]; then
+        relative=08_traffic_block_outbound.json
+        if [[ -f "${temp_dir}/${relative}" ]]; then
+            if [[ ! -f "${XRAY_CONF_DIR}/${relative}" ]] ||
+                ! cmp -s "${temp_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}"; then
+                if ! atomic_copy "${temp_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}" 644; then
+                    apply_failed=true
+                fi
+                changed=true
+            fi
+        elif [[ -f "${XRAY_CONF_DIR}/${relative}" ]]; then
+            rm -f -- "${XRAY_CONF_DIR}/${relative}" || apply_failed=true
             changed=true
         fi
-    elif [[ -f "${XRAY_CONF_DIR}/${relative}" ]]; then
-        rm -f -- "${XRAY_CONF_DIR}/${relative}"
-        changed=true
     fi
-    rm -rf -- "${temp_dir}"
 
-    if [[ ${changed} == true ]]; then
-        restart_xray
+    if [[ ${apply_failed} == true ]]; then
+        restore_xray_files "${backup_dir}" || true
+        rm -rf -- "${temp_dir}" "${backup_dir}"
+        die "写入 Xray 配置失败，已尝试恢复原配置"
+        return 1
     fi
+
+    if [[ ${changed} == true ]] && ! restart_xray; then
+        if restore_xray_files "${backup_dir}"; then
+            restart_xray >/dev/null 2>&1 || true
+            rm -rf -- "${temp_dir}" "${backup_dir}"
+            die "Xray 重启失败，已恢复修改前的配置"
+        else
+            rm -rf -- "${temp_dir}" "${backup_dir}"
+            die "Xray 重启失败，且自动恢复配置未完全成功"
+        fi
+        return 1
+    fi
+
+    rm -rf -- "${temp_dir}" "${backup_dir}"
 }
 
 remove_managed_xray_config() {
@@ -1005,8 +1109,11 @@ disable_monitor() {
 }
 
 display_usage() {
-    local port daily monthly billing total status billing_cycle port_lines
+    local port daily monthly billing total status billing_cycle reasons port_lines last_collect
     ensure_storage || return 1
+    last_collect=$(jq -r '.last_collect_at // 0' "${STATE_FILE}")
+    say "最近采集时间戳：${last_collect}"
+    say "停用方式：Xray inboundTag 黑洞路由（监听 socket 保持开启）"
     port_lines=$(jq -r '.ports | keys[]' "${STATE_FILE}")
     if [[ -z ${port_lines} ]]; then
         say "${yellow} ---> 暂无端口流量数据，请先启用并采集${plain}"
@@ -1031,6 +1138,20 @@ display_usage() {
             "${port}" "$(human_bytes "${daily}")" "$(human_bytes "${monthly}")" \
             "$(human_bytes "${billing}")" "$(human_bytes "${total}")" "${status}"
         printf '  自定义周期起始：%s\n' "${billing_cycle}"
+        if [[ ${status} == 已停用 ]]; then
+            reasons=$(jq -r --arg port "${port}" '
+                .ports[$port].disabled_reasons
+                | map(
+                    if . == "daily" then "每日"
+                    elif . == "monthly" then "自然月"
+                    elif . == "billing" then "自定义结算周期"
+                    elif . == "total" then "累计"
+                    else . end
+                )
+                | join("、")
+            ' "${STATE_FILE}")
+            printf '  黑洞原因：%s\n' "${reasons}"
+        fi
     done <<<"${port_lines}"
 }
 
@@ -1189,6 +1310,188 @@ report_menu() {
     say "${green} ---> 报告已生成：${output}${plain}"
 }
 
+doctor() {
+    local failures=0 warnings=0
+    local api inbounds port_count raw_stats stat_count last_collect
+    local disabled_ports expected_tags actual_tags managed_rule_count legacy_rule_count
+    local traffic_mode config_mode state_mode
+
+    ensure_storage || return 1
+    say "${skyBlue}\n==================== 端口流量监控自检 ====================${plain}"
+
+    if jq -e '.version == 2 and (.ports | type) == "object"' "${CONFIG_FILE}" >/dev/null 2>&1 &&
+        jq -e '.version == 2 and (.ports | type) == "object"' "${STATE_FILE}" >/dev/null 2>&1; then
+        say "${green}[通过] 配置与状态 JSON${plain}"
+    else
+        say "${red}[失败] 配置或状态 JSON 结构错误${plain}"
+        failures=$((failures + 1))
+    fi
+
+    api=$(jq -r '.api // ""' "${CONFIG_FILE}")
+    if valid_api_address "${api}"; then
+        say "${green}[通过] StatsService 仅监听 ${api}${plain}"
+    else
+        say "${red}[失败] StatsService 地址不是安全的 IPv4 回环地址${plain}"
+        failures=$((failures + 1))
+    fi
+
+    if inbounds=$(inbound_json 2>/dev/null); then
+        port_count=$(jq '[.[].port] | unique | length' <<<"${inbounds}")
+        if ((port_count > 0)); then
+            say "${green}[通过] 已发现 ${port_count} 个 Xray 入站端口${plain}"
+        else
+            say "${red}[失败] 未发现可统计的 Xray 入站端口${plain}"
+            failures=$((failures + 1))
+        fi
+    else
+        inbounds='[]'
+        say "${red}[失败] 无法解析 Xray 入站配置${plain}"
+        failures=$((failures + 1))
+    fi
+
+    if [[ ! -x "${XRAY_BIN}" ]]; then
+        if [[ ${TEST_MODE} == 1 ]]; then
+            say "${yellow}[跳过] 测试模式未提供 Xray 二进制${plain}"
+            warnings=$((warnings + 1))
+        else
+            say "${red}[失败] Xray 二进制不存在或不可执行：${XRAY_BIN}${plain}"
+            failures=$((failures + 1))
+        fi
+    elif [[ ${TEST_MODE} == 1 ]]; then
+        say "${yellow}[跳过] 测试模式不执行 Xray 核心校验${plain}"
+        warnings=$((warnings + 1))
+    elif "${XRAY_BIN}" run -test -confdir "${XRAY_CONF_DIR}" >/dev/null 2>>"${COLLECT_LOG}"; then
+        say "${green}[通过] Xray 完整配置校验${plain}"
+    else
+        say "${red}[失败] Xray 完整配置校验未通过${plain}"
+        failures=$((failures + 1))
+    fi
+
+    if config_enabled; then
+        if raw_stats=$(query_xray_stats 2>>"${COLLECT_LOG}") &&
+            valid_stats_response "${raw_stats}"; then
+            stat_count=$(jq '.stat | length' <<<"${raw_stats}")
+            say "${green}[通过] StatsService 响应有效（${stat_count} 个计数器）${plain}"
+        else
+            say "${red}[失败] StatsService 查询失败或响应格式无效${plain}"
+            failures=$((failures + 1))
+        fi
+
+        disabled_ports=$(jq '[.ports | to_entries[]? | select(.value.disabled == true) | .key]' "${STATE_FILE}")
+        expected_tags=$(jq -n --argjson inbounds "${inbounds}" --argjson ports "${disabled_ports}" '
+            [$inbounds[]
+             | . as $item
+             | select($ports | index($item.port))
+             | $item.tag]
+            | unique
+            | sort
+        ')
+        if [[ -f "${XRAY_ROUTING_FILE}" ]]; then
+            actual_tags=$(jq --arg tag "${MANAGED_BLOCK_TAG}" '
+                [.routing.rules[]?
+                 | select(.outboundTag == $tag)
+                 | .inboundTag[]?]
+                | unique
+                | sort
+            ' "${XRAY_ROUTING_FILE}" 2>/dev/null || printf 'null')
+            managed_rule_count=$(jq --arg tag "${MANAGED_BLOCK_TAG}" '
+                [.routing.rules[]? | select(.outboundTag == $tag)] | length
+            ' "${XRAY_ROUTING_FILE}" 2>/dev/null || printf '0')
+            legacy_rule_count=$(jq --arg tag "${LEGACY_BLOCK_TAG}" '
+                [.routing.rules[]? | select(.outboundTag == $tag)] | length
+            ' "${XRAY_ROUTING_FILE}" 2>/dev/null || printf '0')
+        else
+            actual_tags='[]'
+            managed_rule_count=0
+            legacy_rule_count=0
+        fi
+
+        if [[ ${actual_tags} == "${expected_tags}" ]] &&
+            [[ ${legacy_rule_count} -eq 0 ]] &&
+            { [[ $(jq 'length' <<<"${expected_tags}") -eq 0 && ${managed_rule_count} -eq 0 ]] ||
+              [[ $(jq 'length' <<<"${expected_tags}") -gt 0 && ${managed_rule_count} -eq 1 ]]; }; then
+            say "${green}[通过] 黑洞路由与端口停用状态一致${plain}"
+        else
+            say "${red}[失败] 黑洞路由与端口停用状态不一致，请执行 sync-config${plain}"
+            failures=$((failures + 1))
+        fi
+
+        if [[ $(jq 'length' <<<"${expected_tags}") -gt 0 ]]; then
+            if [[ -f "${XRAY_BLOCK_OUTBOUND_FILE}" ]] &&
+                jq -e --arg tag "${MANAGED_BLOCK_TAG}" '
+                    [.outbounds[]? | select(
+                        .tag == $tag and .protocol == "blackhole"
+                    )] | length == 1
+                ' "${XRAY_BLOCK_OUTBOUND_FILE}" >/dev/null 2>&1; then
+                say "${green}[通过] 黑洞 outbound 状态正确${plain}"
+            else
+                say "${red}[失败] 存在停用端口但黑洞 outbound 缺失或无效${plain}"
+                failures=$((failures + 1))
+            fi
+        elif [[ -f "${XRAY_BLOCK_OUTBOUND_FILE}" ]]; then
+            say "${red}[失败] 没有停用端口但仍残留黑洞 outbound${plain}"
+            failures=$((failures + 1))
+        else
+            say "${green}[通过] 黑洞 outbound 状态正确${plain}"
+        fi
+
+        if [[ ${TEST_MODE} != 1 ]]; then
+            if command -v crontab >/dev/null 2>&1 &&
+                crontab -l 2>/dev/null | grep -q '# v2ray-agent-traffic'; then
+                say "${green}[通过] 定时采集任务已安装${plain}"
+            else
+                say "${yellow}[警告] 未检测到定时采集任务${plain}"
+                warnings=$((warnings + 1))
+            fi
+        fi
+    else
+        say "${yellow}[警告] 端口流量监控当前未启用${plain}"
+        warnings=$((warnings + 1))
+        managed_rule_count=0
+        legacy_rule_count=0
+        if [[ -f "${XRAY_ROUTING_FILE}" ]]; then
+            managed_rule_count=$(jq --arg tag "${MANAGED_BLOCK_TAG}" '
+                [.routing.rules[]? | select(.outboundTag == $tag)] | length
+            ' "${XRAY_ROUTING_FILE}" 2>/dev/null || printf '1')
+            legacy_rule_count=$(jq --arg tag "${LEGACY_BLOCK_TAG}" '
+                [.routing.rules[]? | select(.outboundTag == $tag)] | length
+            ' "${XRAY_ROUTING_FILE}" 2>/dev/null || printf '1')
+        fi
+        if [[ ${managed_rule_count} -eq 0 && ${legacy_rule_count} -eq 0 &&
+            ! -f "${XRAY_STATS_FILE}" && ! -f "${XRAY_BLOCK_OUTBOUND_FILE}" ]]; then
+            say "${green}[通过] 未启用状态没有残留托管配置${plain}"
+        else
+            say "${red}[失败] 未启用状态仍有托管配置残留，请执行 sync-config${plain}"
+            failures=$((failures + 1))
+        fi
+    fi
+
+    last_collect=$(jq -r '.last_collect_at // 0' "${STATE_FILE}")
+    if [[ ${last_collect} =~ ^[0-9]+$ ]] && ((last_collect > 0)); then
+        say "${green}[通过] 已保存采集状态（时间戳 ${last_collect}）${plain}"
+    else
+        say "${yellow}[警告] 尚无成功采集记录${plain}"
+        warnings=$((warnings + 1))
+    fi
+
+    traffic_mode=$(stat -c '%a' "${TRAFFIC_DIR}" 2>/dev/null || printf '?')
+    config_mode=$(stat -c '%a' "${CONFIG_FILE}" 2>/dev/null || printf '?')
+    state_mode=$(stat -c '%a' "${STATE_FILE}" 2>/dev/null || printf '?')
+    if [[ ${traffic_mode} == 700 && ${config_mode} == 600 && ${state_mode} == 600 ]]; then
+        say "${green}[通过] 数据目录和状态文件权限正确${plain}"
+    else
+        say "${red}[失败] 权限异常：目录=${traffic_mode} config=${config_mode} state=${state_mode}${plain}"
+        failures=$((failures + 1))
+    fi
+
+    if ((failures == 0)); then
+        say "${green} ---> 自检通过，警告 ${warnings} 项${plain}"
+        return 0
+    fi
+    say "${red} ---> 自检失败 ${failures} 项，警告 ${warnings} 项${plain}"
+    return 1
+}
+
 menu() {
     local choice input
     ensure_storage || return 1
@@ -1206,6 +1509,7 @@ menu() {
         say '5.设置告警与自动停用'
         say '6.立即采集'
         say '7.生成报告'
+        say '8.运行自检'
         say '0.返回'
         read -r -p '请选择：' choice
         case ${choice} in
@@ -1224,6 +1528,7 @@ menu() {
         5) configure_alerts ;;
         6) collect && say "${green} ---> 采集完成${plain}" ;;
         7) report_menu ;;
+        8) doctor ;;
         0) return 0 ;;
         *) say "${red} ---> 选择错误${plain}" ;;
         esac
@@ -1243,6 +1548,7 @@ main() {
         ;;
     view) display_usage ;;
     report) generate_report "${2:-daily}" "${3:-current}" "${4:-false}" ;;
+    doctor) doctor ;;
     discover-ports) ensure_storage && inbound_json ;;
     *) die "未知命令：${command}"; return 1 ;;
     esac
