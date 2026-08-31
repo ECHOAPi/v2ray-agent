@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# Per-user traffic accounting for v2ray-agent.
-# Xray exposes exact per-user counters through its loopback-only StatsService.
+# Per-port traffic accounting for v2ray-agent.
+# Xray exposes exact inbound counters through its loopback-only StatsService.
 
 set -u
 umask 077
@@ -24,7 +24,8 @@ XRAY_POLICY_FILE=${XRAY_CONF_DIR}/12_policy.json
 XRAY_ROUTING_FILE=${XRAY_CONF_DIR}/09_routing.json
 XRAY_STATS_FILE=${XRAY_CONF_DIR}/13_traffic_stats.json
 XRAY_BLOCK_OUTBOUND_FILE=${XRAY_CONF_DIR}/08_traffic_block_outbound.json
-MANAGED_BLOCK_TAG=traffic-block
+MANAGED_BLOCK_TAG=v2ray-agent-traffic-block
+LEGACY_BLOCK_TAG=traffic-block
 DEFAULT_API=127.0.0.1:10085
 TEST_MODE=${V2RAY_AGENT_TEST_MODE:-0}
 COLLECT_LOCK_DIR=
@@ -60,6 +61,22 @@ atomic_json_write() {
     mv -f -- "${temp_file}" "${target}"
 }
 
+atomic_json_write_if_changed() {
+    local target=$1
+    local temp_file
+    temp_file=$(mktemp "${target}.tmp.XXXXXX") || return 1
+    if ! jq . >"${temp_file}"; then
+        rm -f -- "${temp_file}"
+        return 1
+    fi
+    if [[ -f "${target}" ]] && cmp -s "${temp_file}" "${target}"; then
+        rm -f -- "${temp_file}"
+        return 0
+    fi
+    chmod 600 "${temp_file}"
+    mv -f -- "${temp_file}" "${target}"
+}
+
 atomic_copy() {
     local source=$1
     local target=$2
@@ -75,13 +92,14 @@ atomic_copy() {
 }
 
 ensure_storage() {
+    local normalized
     need_command jq || return 1
     mkdir -p "${TRAFFIC_DIR}" "${REPORT_DIR}"
     chmod 700 "${TRAFFIC_DIR}" "${REPORT_DIR}"
 
     if [[ ! -f "${CONFIG_FILE}" ]]; then
         jq -n --arg api "${DEFAULT_API}" '{
-            version: 1,
+            version: 2,
             enabled: false,
             core: "xray",
             api: $api,
@@ -89,26 +107,57 @@ ensure_storage() {
             auto_disable: true,
             scheduled_report: true,
             retention_days: 100,
-            coverage: "xray",
+            coverage: "xray-ports",
             notify: {
                 type: "local",
                 telegram_bot_token: "",
                 telegram_chat_id: "",
                 webhook_url: ""
             },
-            users: {}
+            ports: {}
         }' | atomic_json_write "${CONFIG_FILE}" || return 1
+    else
+        normalized=$(jq '
+            .version = 2
+            | .coverage = "xray-ports"
+            | .ports = (.ports // {})
+            | del(.users)
+        ' "${CONFIG_FILE}") || return 1
+        printf '%s' "${normalized}" |
+            atomic_json_write_if_changed "${CONFIG_FILE}" || return 1
     fi
 
     if [[ ! -f "${STATE_FILE}" ]]; then
         jq -n '{
-            version: 1,
+            version: 2,
             last_collect_at: 0,
             core_counters: {},
-            users: {},
+            ports: {},
             history: {daily: {}, monthly: {}, billing: {}},
             alerts: {}
         }' | atomic_json_write "${STATE_FILE}" || return 1
+    else
+        normalized=$(jq '
+            if (.version // 0) < 2 then
+                {
+                    version: 2,
+                    last_collect_at: 0,
+                    core_counters: {},
+                    ports: {},
+                    history: {daily: {}, monthly: {}, billing: {}},
+                    alerts: {}
+                }
+            else
+                .version = 2
+                | .ports = (.ports // {})
+                | .history = (.history // {daily: {}, monthly: {}, billing: {}})
+                | .alerts = (.alerts // {})
+                | .core_counters = (.core_counters // {})
+                | del(.users)
+            end
+        ' "${STATE_FILE}") || return 1
+        printf '%s' "${normalized}" |
+            atomic_json_write_if_changed "${STATE_FILE}" || return 1
     fi
 
     touch "${ALERT_LOG}" "${COLLECT_LOG}"
@@ -183,47 +232,65 @@ gib_to_bytes() {
     awk -v gib="${value}" 'BEGIN { printf "%.0f", gib * 1073741824 }'
 }
 
-base_user() {
-    local identity=$1
-    printf '%s\n' "${identity%%-*}"
+valid_api_address() {
+    local api=$1
+    local port
+    [[ ${api} =~ ^127[.]0[.]0[.]1:([0-9]{1,5})$ ]] || return 1
+    port=${BASH_REMATCH[1]}
+    ((10#${port} >= 1 && 10#${port} <= 65535))
 }
 
-discover_identities() {
-    local file identity user identity_lines
+discover_inbounds() {
+    local file tag port inbound_lines
     [[ -d "${XRAY_CONF_DIR}" ]] || return 0
     for file in "${XRAY_CONF_DIR}"/*.json; do
         [[ -f "${file}" ]] || continue
-        identity_lines=$(jq -r '.inbounds[]?.settings.clients[]?.email // empty' "${file}" 2>/dev/null || true)
-        while IFS= read -r identity; do
-            [[ -n "${identity}" ]] || continue
-            user=$(base_user "${identity}")
-            [[ -n "${user}" ]] || continue
-            printf '%s\t%s\n' "${user}" "${identity}"
-        done <<<"${identity_lines}"
+        inbound_lines=$(jq -r '
+            .inbounds[]?
+            | select(
+                .tag != null
+                and (.tag | tostring | length) > 0
+                and (
+                    (.port | type) == "number"
+                    or (
+                        (.port | type) == "string"
+                        and (.port | test("^[0-9]+$"))
+                    )
+                )
+              )
+            | (.port | tonumber) as $port
+            | select($port >= 1 and $port <= 65535)
+            | [(.tag | tostring), ($port | tostring)]
+            | @tsv
+        ' "${file}" 2>/dev/null || true)
+        while IFS=$'\t' read -r tag port; do
+            [[ -n ${tag} && -n ${port} ]] || continue
+            printf '%s\t%s\n' "${tag}" "${port}"
+        done <<<"${inbound_lines}"
     done | sort -u
 }
 
-identity_json() {
-    discover_identities | jq -R -s '
+inbound_json() {
+    discover_inbounds | jq -R -s '
         split("\n")
-        | map(select(length > 0) | split("\t") | {base: .[0], identity: .[1]})
-        | unique_by(.identity)
+        | map(select(length > 0) | split("\t") | {tag: .[0], port: .[1]})
+        | unique_by(.tag)
     '
 }
 
-all_user_json() {
-    local identities=$1
+all_port_json() {
+    local inbounds=$1
     local deltas
     deltas=${2-}
     [[ -n ${deltas} ]] || deltas='{}'
     jq -n \
-        --argjson identities "${identities}" \
+        --argjson inbounds "${inbounds}" \
         --argjson deltas "${deltas}" \
         --slurpfile config "${CONFIG_FILE}" \
         --slurpfile state "${STATE_FILE}" '
-        (([$identities[].base]
-          + (($config[0].users // {}) | keys)
-          + (($state[0].users // {}) | keys)
+        (([$inbounds[].port]
+          + (($config[0].ports // {}) | keys)
+          + (($state[0].ports // {}) | keys)
           + ($deltas | keys)) | unique | sort)
     '
 }
@@ -231,35 +298,41 @@ all_user_json() {
 query_xray_stats() {
     local api
     if [[ -n ${V2RAY_AGENT_STATS_FILE:-} ]]; then
-        cat -- "${V2RAY_AGENT_STATS_FILE}"
+        command cat -- "${V2RAY_AGENT_STATS_FILE}"
         return
     fi
     api=$(jq -r '.api // "127.0.0.1:10085"' "${CONFIG_FILE}")
-    "${XRAY_BIN}" api statsquery --server="${api}" -pattern 'user>>>'
+    if ! valid_api_address "${api}"; then
+        die "StatsService 地址必须是 127.0.0.1:1-65535"
+        return 1
+    fi
+    "${XRAY_BIN}" api statsquery --server="${api}" -pattern 'inbound>>>'
 }
 
 aggregate_stats() {
     local raw_stats=$1
-    local identities=$2
+    local inbounds=$2
     local previous_counters
     previous_counters=$(jq '.core_counters // {}' "${STATE_FILE}")
     printf '%s' "${raw_stats}" | jq \
-        --argjson identities "${identities}" \
+        --argjson inbounds "${inbounds}" \
         --argjson previous "${previous_counters}" '
-        ($identities | reduce .[] as $item ({}; .[$item.identity] = $item.base)) as $identity_map
+        ($inbounds | reduce .[] as $item ({}; .[$item.tag] = $item.port)) as $tag_map
         | (reduce (
             .stat[]?
-            | select(.name | test("^user>>>.*>>>traffic>>>(uplink|downlink)$"))
+            | select(.name | test("^inbound>>>.*>>>traffic>>>(uplink|downlink)$"))
           ) as $stat ({}; .[$stat.name] = ($stat.value | tonumber))) as $counters
         | (reduce ($counters | to_entries[]) as $counter ({};
-            ($counter.key | capture("^user>>>(?<identity>.*)>>>traffic>>>(?<direction>uplink|downlink)$").identity) as $identity
-            | ($identity_map[$identity] // ($identity | split("-")[0])) as $user
+            ($counter.key
+             | capture("^inbound>>>(?<tag>.*)>>>traffic>>>(?<direction>uplink|downlink)$").tag
+            ) as $tag
+            | ($tag_map[$tag] // "") as $port
             | ($previous[$counter.key] // 0) as $old_value
             | (if $counter.value >= $old_value
                then ($counter.value - $old_value)
                else $counter.value end) as $delta
-            | if ($user | length) > 0 then
-                .[$user] = ((.[$user] // 0) + $delta)
+            | if ($port | length) > 0 then
+                .[$port] = ((.[$port] // 0) + $delta)
               else . end
           )) as $deltas
         | {counters: $counters, deltas: $deltas}
@@ -267,35 +340,36 @@ aggregate_stats() {
 }
 
 build_billing_keys() {
-    local users=$1
+    local ports=$1
     local day_key=$2
     local result='{}'
-    local user billing_day key user_lines
-    user_lines=$(jq -r '.[]' <<<"${users}")
-    while IFS= read -r user; do
-        billing_day=$(jq -r --arg user "${user}" '.users[$user].billing_day // 1' "${CONFIG_FILE}")
+    local port billing_day key port_lines
+    port_lines=$(jq -r '.[]' <<<"${ports}")
+    while IFS= read -r port; do
+        [[ -n ${port} ]] || continue
+        billing_day=$(jq -r --arg port "${port}" '.ports[$port].billing_day // 1' "${CONFIG_FILE}")
         if [[ ! ${billing_day} =~ ^[0-9]+$ ]] || ((billing_day < 1 || billing_day > 28)); then
             billing_day=1
         fi
         key=$(billing_key "${day_key}" "${billing_day}")
-        result=$(jq --arg user "${user}" --arg key "${key}" '.[$user] = $key' <<<"${result}")
-    done <<<"${user_lines}"
+        result=$(jq --arg port "${port}" --arg key "${key}" '.[$port] = $key' <<<"${result}")
+    done <<<"${port_lines}"
     printf '%s\n' "${result}"
 }
 
 update_state() {
     local deltas=$1
-    local identities=$2
+    local inbounds=$2
     local counters=$3
-    local day_key month_key epoch users billing_keys config state retention
+    local day_key month_key epoch ports billing_keys config state retention
 
     day_key=$(today_key)
     month_key=${day_key:0:7}
     epoch=$(now_epoch)
-    users=$(all_user_json "${identities}" "${deltas}")
-    billing_keys=$(build_billing_keys "${users}" "${day_key}")
-    config=$(cat "${CONFIG_FILE}")
-    state=$(cat "${STATE_FILE}")
+    ports=$(all_port_json "${inbounds}" "${deltas}")
+    billing_keys=$(build_billing_keys "${ports}" "${day_key}")
+    config=$(command cat "${CONFIG_FILE}")
+    state=$(command cat "${STATE_FILE}")
     retention=$(jq -r '.retention_days // 100' "${CONFIG_FILE}")
     if [[ ! ${retention} =~ ^[0-9]+$ ]] || ((retention < 7)); then
         retention=100
@@ -306,13 +380,13 @@ update_state() {
         --argjson config "${config}" \
         --argjson deltas "${deltas}" \
         --argjson counters "${counters}" \
-        --argjson users "${users}" \
+        --argjson ports "${ports}" \
         --argjson billing_keys "${billing_keys}" \
         --arg day "${day_key}" \
         --arg month "${month_key}" \
         --argjson now "${epoch}" \
         --argjson retention "${retention}" '
-        def blank_user($day; $month; $billing): {
+        def blank_port($day; $month; $billing): {
             total: 0,
             daily: {key: $day, bytes: 0},
             monthly: {key: $month, bytes: 0},
@@ -324,7 +398,7 @@ update_state() {
             to_entries | sort_by(.key)
             | if length > $count then .[-$count:] else . end
             | from_entries;
-        def quota_rows($user; $cfg; $usage): [
+        def quota_rows($cfg; $usage): [
             {period: "daily", key: $usage.daily.key, used: $usage.daily.bytes,
              limit: ($cfg.daily_limit // 0)},
             {period: "monthly", key: $usage.monthly.key, used: $usage.monthly.bytes,
@@ -336,21 +410,22 @@ update_state() {
         ];
 
         ($old
-         | .version = 1
+         | .version = 2
          | .last_collect_at = $now
          | .core_counters = $counters
-         | .users = (.users // {})
+         | .ports = (.ports // {})
          | .history = (.history // {daily: {}, monthly: {}, billing: {}})
          | .history.daily = (.history.daily // {})
          | .history.monthly = (.history.monthly // {})
          | .history.billing = (.history.billing // {})
          | .alerts = (.alerts // {})
+         | del(.users)
         ) as $initial
-        | reduce $users[] as $user ($initial;
-            ($deltas[$user] // 0) as $delta
-            | ($billing_keys[$user] // ($day + "-01")) as $billing
-            | (.users[$user] // blank_user($day; $month; $billing)) as $previous
-            | .users[$user] = (
+        | reduce $ports[] as $port ($initial;
+            ($deltas[$port] // 0) as $delta
+            | ($billing_keys[$port] // ($day + "-01")) as $billing
+            | (.ports[$port] // blank_port($day; $month; $billing)) as $previous
+            | .ports[$port] = (
                 $previous
                 | .total = ((.total // 0) + $delta)
                 | .daily = if .daily.key == $day
@@ -363,51 +438,52 @@ update_state() {
                     then {key: $billing, bytes: ((.billing.bytes // 0) + $delta)}
                     else {key: $billing, bytes: $delta} end
             )
-            | .history.daily[$day][$user] = .users[$user].daily.bytes
-            | .history.monthly[$month][$user] = .users[$user].monthly.bytes
-            | .history.billing[$billing][$user] = .users[$user].billing.bytes
+            | .history.daily[$day][$port] = .ports[$port].daily.bytes
+            | .history.monthly[$month][$port] = .ports[$port].monthly.bytes
+            | .history.billing[$billing][$port] = .ports[$port].billing.bytes
         )
         | .history.daily |= keep_last($retention)
         | .history.monthly |= keep_last(36)
         | .history.billing |= keep_last(36)
-        | reduce $users[] as $user (.;
-            ($config.users[$user] // {}) as $cfg
-            | quota_rows($user; $cfg; .users[$user]) as $rows
-            | .users[$user].disabled_reasons = [
+        | reduce $ports[] as $port (.;
+            ($config.ports[$port] // {}) as $cfg
+            | quota_rows($cfg; .ports[$port]) as $rows
+            | .ports[$port].disabled_reasons = [
                 $rows[] | select((.limit // 0) > 0 and .used >= .limit) | .period
               ]
-            | .users[$user].disabled = (
+            | .ports[$port].disabled = (
                 ($config.auto_disable // true)
-                and ((.users[$user].disabled_reasons | length) > 0)
+                and ((.ports[$port].disabled_reasons | length) > 0)
               )
         )
         | . as $next
         | [
-            $users[] as $user
-            | ($config.users[$user] // {}) as $cfg
-            | quota_rows($user; $cfg; $next.users[$user])[]
+            $ports[] as $port
+            | ($config.ports[$port] // {}) as $cfg
+            | quota_rows($cfg; $next.ports[$port])[]
             | select((.limit // 0) > 0)
             | (.used * 100 / .limit) as $percent
             | select($percent >= ($config.alert_percent // 80))
             | . + {
-                user: $user,
+                type: "quota",
+                port: $port,
                 percent: $percent,
                 stage: (if .used >= .limit then "limit" else "threshold" end)
               }
-            | .id = ([.user, .period, .key, .stage] | join("|"))
+            | .id = ([.port, .period, .key, .stage] | join("|"))
             | select(($next.alerts[.id] // 0) == 0)
           ] as $quota_events
         | [
-            $users[] as $user
-            | (($old.users[$user].disabled // false) != ($next.users[$user].disabled // false))
-              as $changed
+            $ports[] as $port
+            | (($old.ports[$port].disabled // false) !=
+               ($next.ports[$port].disabled // false)) as $changed
             | select($changed)
             | {
-                id: (["status", $user, ($now | tostring)] | join("|")),
+                id: (["status", $port, ($now | tostring)] | join("|")),
                 type: "status",
-                user: $user,
-                disabled: ($next.users[$user].disabled // false),
-                reasons: ($next.users[$user].disabled_reasons // [])
+                port: $port,
+                disabled: ($next.ports[$port].disabled // false),
+                reasons: ($next.ports[$port].disabled_reasons // [])
               }
           ] as $status_events
         | reduce $quota_events[] as $event ($next;
@@ -446,40 +522,47 @@ notify_message() {
         [[ ${token} =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || return 0
         [[ ${chat_id} =~ ^[-@A-Za-z0-9_]+$ ]] || return 0
         command -v curl >/dev/null 2>&1 || return 0
-        printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "${token}" | \
-        curl --config - --fail --silent --show-error --max-time 10 \
-            --data-urlencode "chat_id=${chat_id}" \
-            --data-urlencode "text=${message}" \
-            >/dev/null 2>>"${ALERT_LOG}" || true
+        printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "${token}" |
+            curl --config - --fail --silent --show-error --max-time 10 \
+                --data-urlencode "chat_id=${chat_id}" \
+                --data-urlencode "text=${message}" \
+                >/dev/null 2>>"${ALERT_LOG}" || true
         ;;
     webhook)
         url=$(jq -r '.notify.webhook_url // ""' "${CONFIG_FILE}")
         valid_webhook_url "${url}" || return 0
         command -v curl >/dev/null 2>&1 || return 0
         payload=$(jq -n --arg type "${kind}" --arg message "${message}" \
-            --argjson timestamp "$(now_epoch)" '{type: $type, message: $message, timestamp: $timestamp}')
-        printf 'url = "%s"\n' "${url}" | \
-        curl --config - --fail --silent --show-error --max-time 10 \
-            -H 'Content-Type: application/json' --data "${payload}" \
-            >/dev/null 2>>"${ALERT_LOG}" || true
+            --argjson timestamp "$(now_epoch)" \
+            '{type: $type, message: $message, timestamp: $timestamp}')
+        printf 'url = "%s"\n' "${url}" |
+            curl --config - --fail --silent --show-error --max-time 10 \
+                -H 'Content-Type: application/json' --data "${payload}" \
+                >/dev/null 2>>"${ALERT_LOG}" || true
         ;;
     esac
 }
 
 dispatch_events() {
     local events=$1
-    local event type user period key stage used limit percent reasons message event_lines
+    local event type port period key stage used limit percent reasons message event_lines
     event_lines=$(jq -c '.[]' <<<"${events}")
     while IFS= read -r event; do
         [[ -n ${event} ]] || continue
         type=$(jq -r '.type // "quota"' <<<"${event}")
-        user=$(jq -r '.user' <<<"${event}")
+        port=$(jq -r '.port' <<<"${event}")
         if [[ ${type} == status ]]; then
             if [[ $(jq -r '.disabled' <<<"${event}") == true ]]; then
-                reasons=$(jq -r '.reasons | join("、")' <<<"${event}")
-                message="[v2ray-agent] 用户 ${user} 已因流量超额自动停用（${reasons}）"
+                reasons=$(jq -r '.reasons | map(
+                    if . == "daily" then "每日"
+                    elif . == "monthly" then "自然月"
+                    elif . == "billing" then "自定义结算周期"
+                    elif . == "total" then "累计"
+                    else . end
+                ) | join("、")' <<<"${event}")
+                message="[v2ray-agent] 端口 ${port} 已因流量超额自动停用（${reasons}）"
             else
-                message="[v2ray-agent] 用户 ${user} 的结算周期已重置，账号已自动恢复"
+                message="[v2ray-agent] 端口 ${port} 的结算周期已重置，端口已自动恢复"
             fi
             notify_message status "${message}"
             continue
@@ -492,9 +575,9 @@ dispatch_events() {
         limit=$(jq -r '.limit' <<<"${event}")
         percent=$(jq -r '.percent | floor' <<<"${event}")
         if [[ ${stage} == limit ]]; then
-            message="[v2ray-agent] 用户 ${user} 的$(period_label "${period}")流量已超额：$(human_bytes "${used}") / $(human_bytes "${limit}")（周期 ${key}）"
+            message="[v2ray-agent] 端口 ${port} 的$(period_label "${period}")流量已超额：$(human_bytes "${used}") / $(human_bytes "${limit}")（周期 ${key}）"
         else
-            message="[v2ray-agent] 用户 ${user} 的$(period_label "${period}")流量已达到 ${percent}%：$(human_bytes "${used}") / $(human_bytes "${limit}")（周期 ${key}）"
+            message="[v2ray-agent] 端口 ${port} 的$(period_label "${period}")流量已达到 ${percent}%：$(human_bytes "${used}") / $(human_bytes "${limit}")（周期 ${key}）"
         fi
         notify_message quota "${message}"
     done <<<"${event_lines}"
@@ -514,17 +597,25 @@ restart_xray() {
 }
 
 sync_xray_config() {
-    local temp_dir identities disabled_users blocked_identities api changed=false
+    local temp_dir inbounds disabled_ports blocked_tags api changed=false
     local file relative
 
     ensure_storage || return 1
     [[ -d "${XRAY_CONF_DIR}" ]] || return 0
-    identities=$(identity_json)
-    disabled_users=$(jq '[.users | to_entries[]? | select(.value.disabled == true) | .key]' "${STATE_FILE}")
-    blocked_identities=$(jq -n --argjson identities "${identities}" --argjson users "${disabled_users}" '
-        [$identities[] | select(.base as $base | $users | index($base)) | .identity] | unique
+    inbounds=$(inbound_json)
+    disabled_ports=$(jq '[.ports | to_entries[]? | select(.value.disabled == true) | .key]' "${STATE_FILE}")
+    blocked_tags=$(jq -n --argjson inbounds "${inbounds}" --argjson ports "${disabled_ports}" '
+        [$inbounds[]
+         | . as $item
+         | select($ports | index($item.port))
+         | $item.tag]
+        | unique
     ')
     api=$(jq -r '.api // "127.0.0.1:10085"' "${CONFIG_FILE}")
+    if ! valid_api_address "${api}"; then
+        die "StatsService 地址必须是 127.0.0.1:1-65535"
+        return 1
+    fi
 
     temp_dir=$(mktemp -d "${TRAFFIC_DIR}/xray-conf.XXXXXX") || return 1
     for file in "${XRAY_CONF_DIR}"/*.json; do
@@ -533,14 +624,13 @@ sync_xray_config() {
     done
 
     if [[ ! -f "${temp_dir}/12_policy.json" ]]; then
-        printf '%s\n' '{"policy":{"levels":{"0":{}}}}' >"${temp_dir}/12_policy.json"
+        printf '%s\n' '{"policy":{"system":{}}}' >"${temp_dir}/12_policy.json"
     fi
     jq '
         .policy = (.policy // {})
-        | .policy.levels = (.policy.levels // {})
-        | .policy.levels["0"] = (.policy.levels["0"] // {})
-        | .policy.levels["0"].statsUserUplink = true
-        | .policy.levels["0"].statsUserDownlink = true
+        | .policy.system = (.policy.system // {})
+        | .policy.system.statsInboundUplink = true
+        | .policy.system.statsInboundDownlink = true
     ' "${temp_dir}/12_policy.json" >"${temp_dir}/12_policy.json.new" || {
         rm -rf -- "${temp_dir}"
         return 1
@@ -555,13 +645,17 @@ sync_xray_config() {
     if [[ ! -f "${temp_dir}/09_routing.json" ]]; then
         printf '%s\n' '{"routing":{"rules":[]}}' >"${temp_dir}/09_routing.json"
     fi
-    jq --argjson identities "${blocked_identities}" --arg tag "${MANAGED_BLOCK_TAG}" '
+    jq --argjson tags "${blocked_tags}" \
+        --arg tag "${MANAGED_BLOCK_TAG}" --arg legacy "${LEGACY_BLOCK_TAG}" '
         .routing = (.routing // {})
-        | .routing.rules = ([.routing.rules[]? | select(.outboundTag != $tag)])
-        | if ($identities | length) > 0 then
+        | .routing.rules = ([
+            .routing.rules[]?
+            | select(.outboundTag != $tag and .outboundTag != $legacy)
+          ])
+        | if ($tags | length) > 0 then
             .routing.rules = ([{
                 type: "field",
-                user: $identities,
+                inboundTag: $tags,
                 outboundTag: $tag
             }] + .routing.rules)
           else . end
@@ -571,7 +665,7 @@ sync_xray_config() {
     }
     mv -f -- "${temp_dir}/09_routing.json.new" "${temp_dir}/09_routing.json"
 
-    if [[ $(jq 'length' <<<"${blocked_identities}") -gt 0 ]]; then
+    if [[ $(jq 'length' <<<"${blocked_tags}") -gt 0 ]]; then
         jq -n --arg tag "${MANAGED_BLOCK_TAG}" '{
             outbounds: [{tag: $tag, protocol: "blackhole", settings: {response: {type: "none"}}}]
         }' >"${temp_dir}/08_traffic_block_outbound.json"
@@ -587,13 +681,14 @@ sync_xray_config() {
         fi
         if ! "${XRAY_BIN}" run -test -confdir "${temp_dir}" >/dev/null 2>&1; then
             rm -rf -- "${temp_dir}"
-            die "流量监控配置未通过 Xray 校验，原配置未改动"
+            die "端口流量监控配置未通过 Xray 校验，原配置未改动"
             return 1
         fi
     fi
 
     for relative in 12_policy.json 09_routing.json 13_traffic_stats.json; do
-        if [[ ! -f "${XRAY_CONF_DIR}/${relative}" ]] || ! cmp -s "${temp_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}"; then
+        if [[ ! -f "${XRAY_CONF_DIR}/${relative}" ]] ||
+            ! cmp -s "${temp_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}"; then
             atomic_copy "${temp_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}" 644 || {
                 rm -rf -- "${temp_dir}"
                 return 1
@@ -603,7 +698,8 @@ sync_xray_config() {
     done
     relative=08_traffic_block_outbound.json
     if [[ -f "${temp_dir}/${relative}" ]]; then
-        if [[ ! -f "${XRAY_CONF_DIR}/${relative}" ]] || ! cmp -s "${temp_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}"; then
+        if [[ ! -f "${XRAY_CONF_DIR}/${relative}" ]] ||
+            ! cmp -s "${temp_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}"; then
             atomic_copy "${temp_dir}/${relative}" "${XRAY_CONF_DIR}/${relative}" 644 || {
                 rm -rf -- "${temp_dir}"
                 return 1
@@ -626,8 +722,11 @@ remove_managed_xray_config() {
     [[ -d "${XRAY_CONF_DIR}" ]] || return 0
     if [[ -f "${XRAY_ROUTING_FILE}" ]]; then
         temp_file=$(mktemp "${XRAY_ROUTING_FILE}.tmp.XXXXXX") || return 1
-        jq --arg tag "${MANAGED_BLOCK_TAG}" '
-            .routing.rules = ([.routing.rules[]? | select(.outboundTag != $tag)])
+        jq --arg tag "${MANAGED_BLOCK_TAG}" --arg legacy "${LEGACY_BLOCK_TAG}" '
+            .routing.rules = ([
+                .routing.rules[]?
+                | select(.outboundTag != $tag and .outboundTag != $legacy)
+            ])
         ' "${XRAY_ROUTING_FILE}" >"${temp_file}" || {
             rm -f -- "${temp_file}"
             return 1
@@ -661,6 +760,11 @@ cleanup_collect_lock() {
     fi
 }
 
+release_collect_lock() {
+    cleanup_collect_lock
+    trap - EXIT INT TERM
+}
+
 acquire_collect_lock() {
     local owner_pid=
     COLLECT_LOCK_DIR=${TRAFFIC_DIR}/collect.lock
@@ -669,7 +773,7 @@ acquire_collect_lock() {
         return 0
     fi
     if [[ -f "${COLLECT_LOCK_DIR}/pid" ]]; then
-        owner_pid=$(cat "${COLLECT_LOCK_DIR}/pid" 2>/dev/null || true)
+        owner_pid=$(command cat "${COLLECT_LOCK_DIR}/pid" 2>/dev/null || true)
     fi
     if [[ ${owner_pid} =~ ^[0-9]+$ ]] && kill -0 "${owner_pid}" 2>/dev/null; then
         COLLECT_LOCK_DIR=
@@ -686,7 +790,7 @@ acquire_collect_lock() {
 }
 
 collect() {
-    local raw_stats identities stats_result counters deltas result old_state new_state events
+    local raw_stats inbounds stats_result counters deltas result old_state new_state events
     ensure_storage || return 1
     config_enabled || return 0
 
@@ -697,31 +801,39 @@ collect() {
     trap 'cleanup_collect_lock; exit 130' INT
     trap 'cleanup_collect_lock; exit 143' TERM
 
-    identities=$(identity_json)
+    inbounds=$(inbound_json)
     if ! raw_stats=$(query_xray_stats 2>>"${COLLECT_LOG}"); then
         printf '%s stats query failed\n' "$(date '+%F %T')" >>"${COLLECT_LOG}"
+        release_collect_lock
         return 1
     fi
-    if ! stats_result=$(aggregate_stats "${raw_stats}" "${identities}" 2>>"${COLLECT_LOG}"); then
+    if ! stats_result=$(aggregate_stats "${raw_stats}" "${inbounds}" 2>>"${COLLECT_LOG}"); then
         printf '%s invalid stats response\n' "$(date '+%F %T')" >>"${COLLECT_LOG}"
+        release_collect_lock
         return 1
     fi
     counters=$(jq '.counters' <<<"${stats_result}")
     deltas=$(jq '.deltas' <<<"${stats_result}")
-    old_state=$(cat "${STATE_FILE}")
-    result=$(update_state "${deltas}" "${identities}" "${counters}") || return 1
+    old_state=$(command cat "${STATE_FILE}")
+    if ! result=$(update_state "${deltas}" "${inbounds}" "${counters}"); then
+        release_collect_lock
+        return 1
+    fi
     new_state=$(jq '.state' <<<"${result}")
     events=$(jq '.events' <<<"${result}")
-    printf '%s' "${new_state}" | atomic_json_write "${STATE_FILE}" || return 1
+    if ! printf '%s' "${new_state}" | atomic_json_write "${STATE_FILE}"; then
+        release_collect_lock
+        return 1
+    fi
 
     if ! sync_xray_config; then
         printf '%s' "${old_state}" | atomic_json_write "${STATE_FILE}"
+        release_collect_lock
         return 1
     fi
     generate_report daily current false >/dev/null
     dispatch_events "${events}"
-    cleanup_collect_lock
-    trap - EXIT INT TERM
+    release_collect_lock
 }
 
 report_usage_json() {
@@ -760,7 +872,7 @@ report_usage_json() {
     billing)
         jq -n --slurpfile state "${STATE_FILE}" '{
             key: "current",
-            usage: ($state[0].users | with_entries(.value = {
+            usage: ($state[0].ports | with_entries(.value = {
                 bytes: (.value.billing.bytes // 0),
                 cycle: (.value.billing.key // "")
             }))
@@ -769,7 +881,7 @@ report_usage_json() {
     total)
         jq -n --slurpfile state "${STATE_FILE}" '{
             key: "lifetime",
-            usage: ($state[0].users | with_entries(.value = (.value.total // 0)))
+            usage: ($state[0].ports | with_entries(.value = (.value.total // 0)))
         }'
         ;;
     *)
@@ -792,19 +904,19 @@ generate_report() {
 
     if [[ ${period} == billing ]]; then
         jq -r -n --argjson usage "${usage}" --slurpfile state "${STATE_FILE}" '
-            ["用户", "周期起始", "字节", "GiB", "状态"] | @csv,
+            ["端口", "周期起始", "字节", "GiB", "状态"] | @csv,
             ($usage | to_entries | sort_by(.key)[]
              | [.key, .value.cycle, .value.bytes,
                 ((.value.bytes / 1073741824 * 100 | round) / 100),
-                (if ($state[0].users[.key].disabled // false) then "已停用" else "正常" end)]
+                (if ($state[0].ports[.key].disabled // false) then "已停用" else "正常" end)]
              | @csv)
         ' >"${output}"
     else
         jq -r -n --argjson usage "${usage}" --slurpfile state "${STATE_FILE}" '
-            ["用户", "字节", "GiB", "状态"] | @csv,
+            ["端口", "字节", "GiB", "状态"] | @csv,
             ($usage | to_entries | sort_by(-.value)[]
              | [.key, .value, ((.value / 1073741824 * 100 | round) / 100),
-                (if ($state[0].users[.key].disabled // false) then "已停用" else "正常" end)]
+                (if ($state[0].ports[.key].disabled // false) then "已停用" else "正常" end)]
              | @csv)
         ' >"${output}"
     fi
@@ -814,8 +926,8 @@ generate_report() {
         summary=$(jq -r --arg period "$(period_label "${period}")" --arg key "${key}" '
             def amount: if (.value | type) == "object" then .value.bytes else .value end;
             to_entries | sort_by(-(amount)) | .[0:5]
-            | map("\(.key): \(((amount / 1073741824 * 100 | round) / 100)) GiB")
-            | "[v2ray-agent] \($period)流量报告（\($key)）\n" + join("\n")
+            | map("端口 \(.key): \(((amount / 1073741824 * 100 | round) / 100)) GiB")
+            | "[v2ray-agent] \($period)端口流量报告（\($key)）\n" + join("\n")
         ' <<<"${usage}")
         notify_message report "${summary}"
     fi
@@ -854,26 +966,30 @@ enable_monitor() {
     ensure_storage || return 1
     if [[ ! -x "${XRAY_BIN}" || ! -d "${XRAY_CONF_DIR}" ]]; then
         if [[ -x "${SING_BOX_BIN}" ]]; then
-            die "sing-box 官方发布包未编入 with_v2ray_api，无法可靠统计每用户流量；当前未启用此功能"
+            die "sing-box 官方发布包未编入 with_v2ray_api，无法可靠统计入站端口流量；当前未启用此功能"
         else
             die "未检测到 Xray 安装"
         fi
         return 1
     fi
     if [[ -f "${SING_BOX_CONF}" && ${allow_partial} != true ]]; then
-        die "检测到同时运行的 sing-box 协议；其官方二进制不支持用户统计。请显式选择“仅监控 Xray”后继续"
+        die "检测到同时运行的 sing-box 协议；请显式选择“仅监控 Xray 端口”后继续"
         return 1
     fi
 
-    jq '.enabled = true | .core = "xray"' "${CONFIG_FILE}" | atomic_json_write "${CONFIG_FILE}" || return 1
+    jq '.enabled = true | .core = "xray"' "${CONFIG_FILE}" |
+        atomic_json_write "${CONFIG_FILE}" || return 1
     sync_xray_config || {
         jq '.enabled = false' "${CONFIG_FILE}" | atomic_json_write "${CONFIG_FILE}"
         return 1
     }
     install_cron
-    say "${green} ---> 用户流量监控已启用${plain}"
+    say "${green} ---> 端口流量监控已启用${plain}"
     if [[ -f "${SING_BOX_CONF}" ]]; then
-        say "${yellow} ---> 当前只统计 Xray 协议流量，sing-box 协议不会计入额度${plain}"
+        say "${yellow} ---> 当前只统计 Xray 入站端口，sing-box 端口不会计入额度${plain}"
+    fi
+    if ! collect; then
+        say "${yellow} ---> 首次采集失败，定时任务将在下一分钟重试${plain}"
     fi
 }
 
@@ -882,56 +998,65 @@ disable_monitor() {
     jq '.enabled = false' "${CONFIG_FILE}" | atomic_json_write "${CONFIG_FILE}" || return 1
     remove_cron
     if ! remove_managed_xray_config; then
-        die "移除流量监控核心配置失败，请检查 Xray 配置"
+        die "移除端口流量监控核心配置失败，请检查 Xray 配置"
         return 1
     fi
-    say "${green} ---> 用户流量监控已停用，历史数据已保留${plain}"
+    say "${green} ---> 端口流量监控已停用，历史数据已保留，端口限制已解除${plain}"
 }
 
 display_usage() {
-    local user daily monthly billing total status billing_key user_lines
+    local port daily monthly billing total status billing_cycle port_lines
     ensure_storage || return 1
-    printf '\n%-22s %-12s %-12s %-12s %-12s %-8s\n' "用户" "今日" "本月" "结算周期" "累计" "状态"
-    printf '%s\n' '--------------------------------------------------------------------------------------'
-    user_lines=$(jq -r '.users | keys[]' "${STATE_FILE}")
-    while IFS= read -r user; do
-        [[ -n ${user} ]] || continue
-        daily=$(jq -r --arg user "${user}" '.users[$user].daily.bytes // 0' "${STATE_FILE}")
-        monthly=$(jq -r --arg user "${user}" '.users[$user].monthly.bytes // 0' "${STATE_FILE}")
-        billing=$(jq -r --arg user "${user}" '.users[$user].billing.bytes // 0' "${STATE_FILE}")
-        billing_key=$(jq -r --arg user "${user}" '.users[$user].billing.key // "-"' "${STATE_FILE}")
-        total=$(jq -r --arg user "${user}" '.users[$user].total // 0' "${STATE_FILE}")
-        if [[ $(jq -r --arg user "${user}" '.users[$user].disabled // false' "${STATE_FILE}") == true ]]; then
+    port_lines=$(jq -r '.ports | keys[]' "${STATE_FILE}")
+    if [[ -z ${port_lines} ]]; then
+        say "${yellow} ---> 暂无端口流量数据，请先启用并采集${plain}"
+        return 0
+    fi
+    printf '\n%-12s %-12s %-12s %-12s %-12s %-8s\n' \
+        "端口" "今日" "本月" "结算周期" "累计" "状态"
+    printf '%s\n' '------------------------------------------------------------------------'
+    while IFS= read -r port; do
+        [[ -n ${port} ]] || continue
+        daily=$(jq -r --arg port "${port}" '.ports[$port].daily.bytes // 0' "${STATE_FILE}")
+        monthly=$(jq -r --arg port "${port}" '.ports[$port].monthly.bytes // 0' "${STATE_FILE}")
+        billing=$(jq -r --arg port "${port}" '.ports[$port].billing.bytes // 0' "${STATE_FILE}")
+        billing_cycle=$(jq -r --arg port "${port}" '.ports[$port].billing.key // "-"' "${STATE_FILE}")
+        total=$(jq -r --arg port "${port}" '.ports[$port].total // 0' "${STATE_FILE}")
+        if [[ $(jq -r --arg port "${port}" '.ports[$port].disabled // false' "${STATE_FILE}") == true ]]; then
             status=已停用
         else
             status=正常
         fi
-        printf '%-22s %-12s %-12s %-12s %-12s %-8s\n' \
-            "${user}" "$(human_bytes "${daily}")" "$(human_bytes "${monthly}")" \
+        printf '%-12s %-12s %-12s %-12s %-12s %-8s\n' \
+            "${port}" "$(human_bytes "${daily}")" "$(human_bytes "${monthly}")" \
             "$(human_bytes "${billing}")" "$(human_bytes "${total}")" "${status}"
-        printf '  自定义周期起始：%s\n' "${billing_key}"
-    done <<<"${user_lines}"
+        printf '  自定义周期起始：%s\n' "${billing_cycle}"
+    done <<<"${port_lines}"
 }
 
-select_user() {
-    local identities users index i=1 user_lines
-    identities=$(identity_json)
-    users=$(all_user_json "${identities}" '{}')
-    if [[ $(jq 'length' <<<"${users}") -eq 0 ]]; then
-        die "未发现用户"
+select_port() {
+    local inbounds ports index i=1 port tag_list port_lines
+    inbounds=$(inbound_json)
+    ports=$(all_port_json "${inbounds}" '{}')
+    if [[ $(jq 'length' <<<"${ports}") -eq 0 ]]; then
+        die "未发现 Xray 入站端口"
         return 1
     fi
-    user_lines=$(jq -r '.[]' <<<"${users}")
-    while IFS= read -r user; do
-        printf '%d.%s\n' "${i}" "${user}" >&2
+    port_lines=$(jq -r '.[]' <<<"${ports}")
+    while IFS= read -r port; do
+        tag_list=$(jq -r --arg port "${port}" '
+            [.[] | select(.port == $port) | .tag] | unique | join(", ")
+        ' <<<"${inbounds}")
+        [[ -n ${tag_list} ]] || tag_list=仅存在于配置或历史
+        printf '%d.%s（%s）\n' "${i}" "${port}" "${tag_list}" >&2
         i=$((i + 1))
-    done <<<"${user_lines}"
-    read -r -p '请选择用户编号：' index
+    done <<<"${port_lines}"
+    read -r -p '请选择端口编号：' index
     if [[ ! ${index} =~ ^[0-9]+$ ]] || ((index < 1 || index > i - 1)); then
         die "选择错误"
         return 1
     fi
-    jq -r ".[$((index - 1))]" <<<"${users}"
+    jq -r ".[$((index - 1))]" <<<"${ports}"
 }
 
 read_limit() {
@@ -948,11 +1073,11 @@ read_limit() {
     printf '%s\n' "${bytes}"
 }
 
-configure_user() {
-    local user current daily monthly billing total billing_day input temp
+configure_port() {
+    local port current daily monthly billing total billing_day input temp
     ensure_storage || return 1
-    user=$(select_user) || return 1
-    current=$(jq -c --arg user "${user}" '.users[$user] // {}' "${CONFIG_FILE}")
+    port=$(select_port) || return 1
+    current=$(jq -c --arg port "${port}" '.ports[$port] // {}' "${CONFIG_FILE}")
     daily=$(read_limit '每日额度' "$(jq -r '.daily_limit // 0' <<<"${current}")") || return 1
     monthly=$(read_limit '自然月额度' "$(jq -r '.monthly_limit // 0' <<<"${current}")") || return 1
     total=$(read_limit '累计额度' "$(jq -r '.total_limit // 0' <<<"${current}")") || return 1
@@ -967,11 +1092,11 @@ configure_user() {
         billing_day=${input}
     fi
 
-    temp=$(jq --arg user "${user}" \
+    temp=$(jq --arg port "${port}" \
         --argjson daily "${daily}" --argjson monthly "${monthly}" \
         --argjson total "${total}" --argjson billing "${billing}" \
         --argjson billing_day "${billing_day}" '
-        .users[$user] = {
+        .ports[$port] = {
             daily_limit: $daily,
             monthly_limit: $monthly,
             total_limit: $total,
@@ -980,8 +1105,10 @@ configure_user() {
         }
     ' "${CONFIG_FILE}") || return 1
     printf '%s' "${temp}" | atomic_json_write "${CONFIG_FILE}" || return 1
-    say "${green} ---> ${user} 的流量额度已保存${plain}"
-    collect
+    say "${green} ---> 端口 ${port} 的流量额度已保存${plain}"
+    if config_enabled; then
+        collect
+    fi
 }
 
 configure_alerts() {
@@ -996,8 +1123,8 @@ configure_alerts() {
         fi
         percent=${input}
     fi
-    read -r -p '超额后自动停用？[y/n]：' input
-    if [[ ${input} == n ]]; then auto_disable=false; else auto_disable=true; fi
+    read -r -p '超额后自动停用端口？[Y/n]：' input
+    if [[ ${input} == n || ${input} == N ]]; then auto_disable=false; else auto_disable=true; fi
     say "1.仅本地日志（${ALERT_LOG}）"
     say '2.Telegram'
     say '3.Webhook（POST JSON）'
@@ -1039,6 +1166,9 @@ configure_alerts() {
     ' "${CONFIG_FILE}") || return 1
     printf '%s' "${temp}" | atomic_json_write "${CONFIG_FILE}" || return 1
     say "${green} ---> 告警设置已保存${plain}"
+    if config_enabled; then
+        collect
+    fi
 }
 
 report_menu() {
@@ -1063,7 +1193,7 @@ menu() {
     local choice input
     ensure_storage || return 1
     while true; do
-        say "${skyBlue}\n==================== 用户流量监控 ====================${plain}"
+        say "${skyBlue}\n==================== 端口流量监控 ====================${plain}"
         if config_enabled; then
             say "状态：${green}已启用${plain}"
         else
@@ -1071,8 +1201,8 @@ menu() {
         fi
         say '1.启用监控'
         say '2.停用监控'
-        say '3.查看用户流量'
-        say '4.设置用户额度与结算日'
+        say '3.查看端口流量'
+        say '4.设置端口额度与结算日'
         say '5.设置告警与自动停用'
         say '6.立即采集'
         say '7.生成报告'
@@ -1081,16 +1211,16 @@ menu() {
         case ${choice} in
         1)
             if [[ -f "${SING_BOX_CONF}" ]]; then
-                say "${yellow}检测到 sing-box。官方发布包不能精确统计其用户流量。${plain}"
-                read -r -p '是否明确仅监控 Xray 协议流量？[y/n]：' input
-                [[ ${input} == y ]] && enable_monitor true
+                say "${yellow}检测到 sing-box；当前组件只统计 Xray 入站端口。${plain}"
+                read -r -p '是否明确仅监控 Xray 端口？[y/N]：' input
+                [[ ${input} == y || ${input} == Y ]] && enable_monitor true
             else
                 enable_monitor false
             fi
             ;;
         2) disable_monitor ;;
         3) display_usage ;;
-        4) configure_user ;;
+        4) configure_port ;;
         5) configure_alerts ;;
         6) collect && say "${green} ---> 采集完成${plain}" ;;
         7) report_menu ;;
@@ -1113,7 +1243,7 @@ main() {
         ;;
     view) display_usage ;;
     report) generate_report "${2:-daily}" "${3:-current}" "${4:-false}" ;;
-    discover-users) ensure_storage && identity_json ;;
+    discover-ports) ensure_storage && inbound_json ;;
     *) die "未知命令：${command}"; return 1 ;;
     esac
 }
