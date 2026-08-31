@@ -160,6 +160,17 @@ assert_jq "${TRAFFIC_DIR}/state.json" '
     and .core_counters["inbound>>>VLESSTCP>>>traffic>>>uplink"] == 0
 ' 'omitted zero-valued protobuf counters were rejected or miscounted'
 
+# A cheap preflight check repairs managed config drift before querying stats.
+config_tmp=${TEST_ROOT}/policy-drift.json
+jq '.policy.system.statsInboundUplink = false' \
+    "${XRAY_CONF_DIR}/12_policy.json" >"${config_tmp}"
+mv "${config_tmp}" "${XRAY_CONF_DIR}/12_policy.json"
+run_monitor collect
+assert_jq "${XRAY_CONF_DIR}/12_policy.json" '
+    .policy.system.statsInboundUplink == true
+    and .policy.system.statsInboundDownlink == true
+' 'managed config drift was not repaired before collection'
+
 # 80% threshold: aggregate every Xray inbound tag that listens on port 443.
 STATS_FILE=${TEST_ROOT}/stats-threshold.json
 write_stats "${STATS_FILE}" 400 400 400 400 100
@@ -179,6 +190,7 @@ assert_jq "${TRAFFIC_DIR}/state.json" '.ports["443"].disabled == false and has("
     'threshold warning must not disable the port or create user state'
 grep -q '端口 443.*达到 80%' "${TRAFFIC_DIR}/alerts.log" || fail 'port threshold alert missing'
 assert_no_file "${XRAY_CONF_DIR}/08_traffic_block_outbound.json"
+assert_no_file "${TRAFFIC_DIR}/reports/daily-2026-08-31.csv"
 
 # A failed Xray restart must roll back every managed config file.
 cp "${XRAY_CONF_DIR}/09_routing.json" "${TEST_ROOT}/routing-before-restart-failure.json"
@@ -312,6 +324,12 @@ assert_jq "${XRAY_CONF_DIR}/09_routing.json" '
 grep -q '端口 443.*黑洞规则已自动移除' "${TRAFFIC_DIR}/alerts.log" || \
     fail 'automatic port recovery alert missing'
 
+# The scheduled job creates the completed previous-day report once per day.
+scheduled_report_path=$(run_monitor report daily previous false)
+[[ ${scheduled_report_path} == "${TRAFFIC_DIR}/reports/daily-2026-08-31.csv" ]] ||
+    fail 'scheduled previous-day report selected the wrong period'
+assert_file "${scheduled_report_path}"
+
 # A custom billing quota resets only on its configured billing day.
 config_tmp=${TEST_ROOT}/config-billing.json
 jq '.ports["443"].daily_limit = 0 | .ports["443"].billing_limit = 2000' \
@@ -362,6 +380,21 @@ grep -q '自检通过' <<<"${doctor_output}" || {
     printf '%s\n' "${doctor_output}" >&2
     fail 'doctor command did not pass a consistent monitored state'
 }
+
+# An enabled monitor with no recent successful sample must fail self-check.
+cp "${TRAFFIC_DIR}/state.json" "${TEST_ROOT}/state-before-stale-doctor.json"
+state_tmp=${TEST_ROOT}/state-stale-doctor.json
+jq --argjson stale "$((NOW_EPOCH - 600))" '.last_collect_at = $stale' \
+    "${TRAFFIC_DIR}/state.json" >"${state_tmp}"
+mv "${state_tmp}" "${TRAFFIC_DIR}/state.json"
+if stale_doctor_output=$(run_monitor doctor 2>&1); then
+    fail 'doctor accepted a stale collection timestamp'
+fi
+grep -q '最近采集已过期' <<<"${stale_doctor_output}" || {
+    printf '%s\n' "${stale_doctor_output}" >&2
+    fail 'doctor did not explain the stale collection failure'
+}
+cp "${TEST_ROOT}/state-before-stale-doctor.json" "${TRAFFIC_DIR}/state.json"
 
 # A live collector lock prevents an interactive disable from racing config writes.
 mkdir "${TRAFFIC_DIR}/collect.lock"

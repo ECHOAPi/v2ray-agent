@@ -28,6 +28,7 @@ LEGACY_BLOCK_TAG=traffic-block
 DEFAULT_API=127.0.0.1:10085
 TEST_MODE=${V2RAY_AGENT_TEST_MODE:-0}
 COLLECT_LOCK_DIR=
+COLLECT_LOCK_TOKEN=
 
 red='\033[31m'
 green='\033[32m'
@@ -185,32 +186,6 @@ now_epoch() {
     fi
 }
 
-billing_key() {
-    local date_key=$1
-    local billing_day=$2
-    local year month day previous_month
-
-    year=${date_key:0:4}
-    month=${date_key:5:2}
-    day=${date_key:8:2}
-    year=$((10#${year}))
-    month=$((10#${month}))
-    day=$((10#${day}))
-
-    if ((billing_day < 1 || billing_day > 28)); then
-        billing_day=1
-    fi
-    if ((day < billing_day)); then
-        previous_month=$((month - 1))
-        if ((previous_month == 0)); then
-            previous_month=12
-            year=$((year - 1))
-        fi
-        month=${previous_month}
-    fi
-    printf '%04d-%02d-%02d\n' "${year}" "${month}" "${billing_day}"
-}
-
 human_bytes() {
     awk -v bytes="${1:-0}" 'BEGIN {
         split("B KiB MiB GiB TiB PiB", unit, " ");
@@ -310,6 +285,19 @@ query_xray_stats() {
     "${XRAY_BIN}" api statsquery --server="${api}" -pattern 'inbound>>>'
 }
 
+query_xray_stats_with_retry() {
+    local attempt output
+    for attempt in 1 2 3; do
+        if output=$(query_xray_stats); then
+            printf '%s\n' "${output}"
+            return 0
+        fi
+        [[ -n ${V2RAY_AGENT_STATS_FILE:-} ]] && break
+        ((attempt < 3)) && sleep 1
+    done
+    return 1
+}
+
 valid_stats_response() {
     local raw_stats=$1
     printf '%s' "${raw_stats}" | jq -e '
@@ -370,42 +358,55 @@ aggregate_stats() {
 build_billing_keys() {
     local ports=$1
     local day_key=$2
-    local result='{}'
-    local port billing_day key port_lines
-    port_lines=$(jq -r '.[]' <<<"${ports}")
-    while IFS= read -r port; do
-        [[ -n ${port} ]] || continue
-        billing_day=$(jq -r --arg port "${port}" '.ports[$port].billing_day // 1' "${CONFIG_FILE}")
-        if [[ ! ${billing_day} =~ ^[0-9]+$ ]] || ((billing_day < 1 || billing_day > 28)); then
-            billing_day=1
-        fi
-        key=$(billing_key "${day_key}" "${billing_day}")
-        result=$(jq --arg port "${port}" --arg key "${key}" '.[$port] = $key' <<<"${result}")
-    done <<<"${port_lines}"
-    printf '%s\n' "${result}"
+    jq -n \
+        --argjson ports "${ports}" \
+        --arg day "${day_key}" \
+        --slurpfile config "${CONFIG_FILE}" '
+        def valid_billing_day:
+            (if type == "number" then .
+             elif type == "string" and test("^[0-9]+$") then tonumber
+             else 1 end)
+            | if . == floor and . >= 1 and . <= 28 then . else 1 end;
+        def pad2:
+            tostring | if length < 2 then "0" + . else . end;
+        ($day[0:4] | tonumber) as $year
+        | ($day[5:7] | tonumber) as $month
+        | ($day[8:10] | tonumber) as $day_of_month
+        | reduce $ports[] as $port ({};
+            (($config[0].ports[$port].billing_day // 1) | valid_billing_day) as $billing_day
+            | (if $day_of_month < $billing_day then
+                   if $month == 1
+                   then {year: ($year - 1), month: 12}
+                   else {year: $year, month: ($month - 1)} end
+               else {year: $year, month: $month} end) as $period
+            | .[$port] = (
+                ($period.year | tostring) + "-"
+                + ($period.month | pad2) + "-"
+                + ($billing_day | pad2)
+              )
+          )
+    '
 }
 
 update_state() {
     local deltas=$1
     local inbounds=$2
     local counters=$3
-    local day_key month_key epoch ports billing_keys config state retention
+    local day_key month_key epoch ports billing_keys retention
 
     day_key=$(today_key)
     month_key=${day_key:0:7}
     epoch=$(now_epoch)
     ports=$(all_port_json "${inbounds}" "${deltas}")
     billing_keys=$(build_billing_keys "${ports}" "${day_key}")
-    config=$(command cat "${CONFIG_FILE}")
-    state=$(command cat "${STATE_FILE}")
     retention=$(jq -r '.retention_days // 100' "${CONFIG_FILE}")
     if [[ ! ${retention} =~ ^[0-9]+$ ]] || ((retention < 7)); then
         retention=100
     fi
 
     jq -n \
-        --argjson old "${state}" \
-        --argjson config "${config}" \
+        --slurpfile old_data "${STATE_FILE}" \
+        --slurpfile config_data "${CONFIG_FILE}" \
         --argjson deltas "${deltas}" \
         --argjson counters "${counters}" \
         --argjson ports "${ports}" \
@@ -437,7 +438,9 @@ update_state() {
              limit: ($cfg.total_limit // 0)}
         ];
 
-        ($old
+        ($old_data[0]) as $old
+        | ($config_data[0]) as $config
+        | ($old
          | .version = 2
          | .last_collect_at = $now
          | .core_counters = $counters
@@ -672,21 +675,85 @@ restore_xray_files() {
     [[ ${failed} == false ]]
 }
 
+blocked_tags_for_inbounds() {
+    local inbounds=$1
+    jq -n --argjson inbounds "${inbounds}" --slurpfile state "${STATE_FILE}" '
+        (($state[0].ports // {})
+         | to_entries
+         | map(select((.value.disabled // false) == true) | .key)) as $ports
+        | [$inbounds[]
+           | . as $item
+           | select($ports | index($item.port))
+           | $item.tag]
+        | unique
+        | sort
+    '
+}
+
+managed_xray_config_matches_state() {
+    local inbounds=$1
+    local api blocked_tags blocked_count
+
+    api=$(jq -r '.api // "127.0.0.1:10085"' "${CONFIG_FILE}")
+    valid_api_address "${api}" || return 1
+    blocked_tags=$(blocked_tags_for_inbounds "${inbounds}") || return 1
+    blocked_count=$(jq 'length' <<<"${blocked_tags}")
+
+    [[ -f "${XRAY_CONF_DIR}/12_policy.json" ]] &&
+        jq -e '
+            .policy.system.statsInboundUplink == true
+            and .policy.system.statsInboundDownlink == true
+        ' "${XRAY_CONF_DIR}/12_policy.json" >/dev/null 2>&1 || return 1
+
+    [[ -f "${XRAY_STATS_FILE}" ]] &&
+        jq -e --arg api "${api}" '
+            .stats == {}
+            and .api == {
+                tag: "traffic-api",
+                listen: $api,
+                services: ["StatsService"]
+            }
+        ' "${XRAY_STATS_FILE}" >/dev/null 2>&1 || return 1
+
+    if [[ -f "${XRAY_ROUTING_FILE}" ]]; then
+        jq -e --argjson expected "${blocked_tags}" \
+            --arg tag "${MANAGED_BLOCK_TAG}" --arg legacy "${LEGACY_BLOCK_TAG}" '
+            ([.routing.rules[]? | select(.outboundTag == $tag)]) as $managed
+            | ([.routing.rules[]? | select(.outboundTag == $legacy)] | length) == 0
+            and if ($expected | length) > 0 then
+                ($managed | length) == 1
+                and $managed[0].type == "field"
+                and (($managed[0].inboundTag // [] | unique | sort) == ($expected | sort))
+              else
+                ($managed | length) == 0
+              end
+        ' "${XRAY_ROUTING_FILE}" >/dev/null 2>&1 || return 1
+    elif ((blocked_count > 0)); then
+        return 1
+    fi
+
+    if ((blocked_count > 0)); then
+        [[ -f "${XRAY_BLOCK_OUTBOUND_FILE}" ]] &&
+            jq -e --arg tag "${MANAGED_BLOCK_TAG}" '
+                (.outbounds | type) == "array"
+                and (.outbounds | length) == 1
+                and .outbounds[0].tag == $tag
+                and .outbounds[0].protocol == "blackhole"
+            ' "${XRAY_BLOCK_OUTBOUND_FILE}" >/dev/null 2>&1 || return 1
+    elif [[ -f "${XRAY_BLOCK_OUTBOUND_FILE}" ]]; then
+        return 1
+    fi
+    return 0
+}
+
 sync_xray_config() {
-    local temp_dir backup_dir inbounds disabled_ports blocked_tags api changed=false
+    local temp_dir backup_dir inbounds blocked_tags api changed=false
     local file relative apply_failed=false
 
     ensure_storage || return 1
     [[ -d "${XRAY_CONF_DIR}" ]] || return 0
     inbounds=$(inbound_json)
-    disabled_ports=$(jq '[.ports | to_entries[]? | select(.value.disabled == true) | .key]' "${STATE_FILE}")
-    blocked_tags=$(jq -n --argjson inbounds "${inbounds}" --argjson ports "${disabled_ports}" '
-        [$inbounds[]
-         | . as $item
-         | select($ports | index($item.port))
-         | $item.tag]
-        | unique
-    ')
+    blocked_tags=$(blocked_tags_for_inbounds "${inbounds}") || return 1
     api=$(jq -r '.api // "127.0.0.1:10085"' "${CONFIG_FILE}")
     if ! valid_api_address "${api}"; then
         die "StatsService 地址必须是 127.0.0.1:1-65535"
@@ -912,11 +979,38 @@ remove_managed_xray_config() {
     rm -rf -- "${temp_dir}" "${backup_dir}"
 }
 
+process_start_id() {
+    local pid=$1 start_id
+    [[ ${pid} =~ ^[0-9]+$ && -r /proc/${pid}/stat ]] || return 1
+    start_id=$(awk '{sub(/^.*[)] /, ""); print $20}' "/proc/${pid}/stat" 2>/dev/null) ||
+        return 1
+    [[ ${start_id} =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${start_id}"
+}
+
+write_collect_lock_owner() {
+    local start_id=
+    COLLECT_LOCK_TOKEN="$$:$(now_epoch):${RANDOM}${RANDOM}"
+    printf '%s\n' "$$" >"${COLLECT_LOCK_DIR}/pid" || return 1
+    printf '%s\n' "${COLLECT_LOCK_TOKEN}" >"${COLLECT_LOCK_DIR}/token" || return 1
+    if start_id=$(process_start_id "$$"); then
+        printf '%s\n' "${start_id}" >"${COLLECT_LOCK_DIR}/start_id" || return 1
+    fi
+}
+
 cleanup_collect_lock() {
+    local current_token=
     if [[ -n ${COLLECT_LOCK_DIR} ]]; then
-        rm -f -- "${COLLECT_LOCK_DIR}/pid"
-        rmdir "${COLLECT_LOCK_DIR}" 2>/dev/null || true
+        if [[ -f "${COLLECT_LOCK_DIR}/token" ]]; then
+            current_token=$(command cat "${COLLECT_LOCK_DIR}/token" 2>/dev/null || true)
+        fi
+        if [[ -n ${COLLECT_LOCK_TOKEN} && ${current_token} == "${COLLECT_LOCK_TOKEN}" ]]; then
+            rm -f -- "${COLLECT_LOCK_DIR}/pid" "${COLLECT_LOCK_DIR}/start_id" \
+                "${COLLECT_LOCK_DIR}/token"
+            rmdir "${COLLECT_LOCK_DIR}" 2>/dev/null || true
+        fi
         COLLECT_LOCK_DIR=
+        COLLECT_LOCK_TOKEN=
     fi
 }
 
@@ -926,31 +1020,55 @@ release_collect_lock() {
 }
 
 acquire_collect_lock() {
-    local owner_pid=
+    local owner_pid='' owner_start_id='' current_start_id=''
     COLLECT_LOCK_DIR=${TRAFFIC_DIR}/collect.lock
     if mkdir "${COLLECT_LOCK_DIR}" 2>/dev/null; then
-        printf '%s\n' "$$" >"${COLLECT_LOCK_DIR}/pid"
-        return 0
+        if write_collect_lock_owner; then
+            return 0
+        fi
+        rm -f -- "${COLLECT_LOCK_DIR}/pid" "${COLLECT_LOCK_DIR}/start_id" \
+            "${COLLECT_LOCK_DIR}/token"
+        rmdir "${COLLECT_LOCK_DIR}" 2>/dev/null || true
+        COLLECT_LOCK_DIR=
+        COLLECT_LOCK_TOKEN=
+        return 1
     fi
     if [[ -f "${COLLECT_LOCK_DIR}/pid" ]]; then
         owner_pid=$(command cat "${COLLECT_LOCK_DIR}/pid" 2>/dev/null || true)
     fi
     if [[ ${owner_pid} =~ ^[0-9]+$ ]] && kill -0 "${owner_pid}" 2>/dev/null; then
-        COLLECT_LOCK_DIR=
-        return 1
+        if [[ -f "${COLLECT_LOCK_DIR}/start_id" ]]; then
+            owner_start_id=$(command cat "${COLLECT_LOCK_DIR}/start_id" 2>/dev/null || true)
+            current_start_id=$(process_start_id "${owner_pid}" 2>/dev/null || true)
+            if [[ -z ${owner_start_id} || -z ${current_start_id} ||
+                ${owner_start_id} == "${current_start_id}" ]]; then
+                COLLECT_LOCK_DIR=
+                return 1
+            fi
+        else
+            COLLECT_LOCK_DIR=
+            return 1
+        fi
     fi
-    rm -f -- "${COLLECT_LOCK_DIR}/pid"
+    rm -f -- "${COLLECT_LOCK_DIR}/pid" "${COLLECT_LOCK_DIR}/start_id" \
+        "${COLLECT_LOCK_DIR}/token"
     rmdir "${COLLECT_LOCK_DIR}" 2>/dev/null || true
     if mkdir "${COLLECT_LOCK_DIR}" 2>/dev/null; then
-        printf '%s\n' "$$" >"${COLLECT_LOCK_DIR}/pid"
-        return 0
+        if write_collect_lock_owner; then
+            return 0
+        fi
+        rm -f -- "${COLLECT_LOCK_DIR}/pid" "${COLLECT_LOCK_DIR}/start_id" \
+            "${COLLECT_LOCK_DIR}/token"
+        rmdir "${COLLECT_LOCK_DIR}" 2>/dev/null || true
     fi
     COLLECT_LOCK_DIR=
+    COLLECT_LOCK_TOKEN=
     return 1
 }
 
 collect() {
     local raw_stats inbounds stats_result counters deltas result old_state new_state events
+    local status_changed
     ensure_storage || return 1
     config_enabled || return 0
 
@@ -962,7 +1080,14 @@ collect() {
     trap 'cleanup_collect_lock; exit 143' TERM
 
     inbounds=$(inbound_json)
-    if ! raw_stats=$(query_xray_stats 2>>"${COLLECT_LOG}"); then
+    if ! managed_xray_config_matches_state "${inbounds}"; then
+        if ! sync_xray_config; then
+            printf '%s managed config sync failed\n' "$(date '+%F %T')" >>"${COLLECT_LOG}"
+            release_collect_lock
+            return 1
+        fi
+    fi
+    if ! raw_stats=$(query_xray_stats_with_retry 2>>"${COLLECT_LOG}"); then
         printf '%s stats query failed\n' "$(date '+%F %T')" >>"${COLLECT_LOG}"
         release_collect_lock
         return 1
@@ -981,17 +1106,17 @@ collect() {
     fi
     new_state=$(jq '.state' <<<"${result}")
     events=$(jq '.events' <<<"${result}")
+    status_changed=$(jq -r 'any(.[]; .type == "status")' <<<"${events}")
     if ! printf '%s' "${new_state}" | atomic_json_write "${STATE_FILE}"; then
         release_collect_lock
         return 1
     fi
 
-    if ! sync_xray_config; then
+    if [[ ${status_changed} == true ]] && ! sync_xray_config; then
         printf '%s' "${old_state}" | atomic_json_write "${STATE_FILE}"
         release_collect_lock
         return 1
     fi
-    generate_report daily current false >/dev/null
     dispatch_events "${events}"
     release_collect_lock
 }
@@ -1055,32 +1180,43 @@ generate_report() {
     local period=${1:-daily}
     local selector=${2:-current}
     local should_notify=${3:-false}
-    local report_data key usage output summary
+    local report_data key usage output temp_output summary
     ensure_storage || return 1
     report_data=$(report_usage_json "${period}" "${selector}") || return 1
     key=$(jq -r '.key' <<<"${report_data}")
     usage=$(jq '.usage' <<<"${report_data}")
     output=${REPORT_DIR}/${period}-${key}.csv
+    temp_output=$(mktemp "${output}.tmp.XXXXXX") || return 1
 
     if [[ ${period} == billing ]]; then
-        jq -r -n --argjson usage "${usage}" --slurpfile state "${STATE_FILE}" '
+        if ! jq -r -n --argjson usage "${usage}" --slurpfile state "${STATE_FILE}" '
             ["端口", "周期起始", "字节", "GiB", "状态"] | @csv,
             ($usage | to_entries | sort_by(.key)[]
              | [.key, .value.cycle, .value.bytes,
                 ((.value.bytes / 1073741824 * 100 | round) / 100),
                 (if ($state[0].ports[.key].disabled // false) then "已停用" else "正常" end)]
              | @csv)
-        ' >"${output}"
+        ' >"${temp_output}"; then
+            rm -f -- "${temp_output}"
+            return 1
+        fi
     else
-        jq -r -n --argjson usage "${usage}" --slurpfile state "${STATE_FILE}" '
+        if ! jq -r -n --argjson usage "${usage}" --slurpfile state "${STATE_FILE}" '
             ["端口", "字节", "GiB", "状态"] | @csv,
             ($usage | to_entries | sort_by(-.value)[]
              | [.key, .value, ((.value / 1073741824 * 100 | round) / 100),
                 (if ($state[0].ports[.key].disabled // false) then "已停用" else "正常" end)]
              | @csv)
-        ' >"${output}"
+        ' >"${temp_output}"; then
+            rm -f -- "${temp_output}"
+            return 1
+        fi
     fi
-    chmod 600 "${output}"
+    if ! chmod 600 "${temp_output}" ||
+        ! mv -f -- "${temp_output}" "${output}"; then
+        rm -f -- "${temp_output}"
+        return 1
+    fi
 
     if [[ ${should_notify} == true ]]; then
         summary=$(jq -r --arg period "$(period_label "${period}")" --arg key "${key}" '
@@ -1404,17 +1540,28 @@ configure_alerts() {
         fi
         ;;
     esac
-    temp=$(jq --argjson percent "${percent}" --argjson auto "${auto_disable}" \
-        --arg type "${notify_type}" --arg token "${token}" --arg chat "${chat_id}" --arg url "${url}" '
-        .alert_percent = $percent
-        | .auto_disable = $auto
-        | .notify = {
-            type: $type,
-            telegram_bot_token: $token,
-            telegram_chat_id: $chat,
-            webhook_url: $url
-          }
-    ' "${CONFIG_FILE}") || return 1
+    temp=$(
+        {
+            printf '%s\n' "${token}"
+            printf '%s\n' "${chat_id}"
+            printf '%s\n' "${url}"
+        } | jq -Rs \
+            --slurpfile config "${CONFIG_FILE}" \
+            --argjson percent "${percent}" \
+            --argjson auto "${auto_disable}" \
+            --arg type "${notify_type}" '
+            split("\n") as $secret
+            | $config[0]
+            | .alert_percent = $percent
+            | .auto_disable = $auto
+            | .notify = {
+                type: $type,
+                telegram_bot_token: $secret[0],
+                telegram_chat_id: $secret[1],
+                webhook_url: $secret[2]
+              }
+        '
+    ) || return 1
     printf '%s' "${temp}" | atomic_json_write "${CONFIG_FILE}" || return 1
     say "${green} ---> 告警设置已保存${plain}"
     if config_enabled; then
@@ -1442,7 +1589,7 @@ report_menu() {
 
 doctor() {
     local failures=0 warnings=0
-    local api inbounds port_count raw_stats stat_count last_collect
+    local api inbounds port_count raw_stats stat_count last_collect current_epoch collect_age
     local disabled_ports expected_tags actual_tags managed_rule_count legacy_rule_count
     local traffic_mode config_mode state_mode
 
@@ -1598,10 +1745,33 @@ doctor() {
 
     last_collect=$(jq -r '.last_collect_at // 0' "${STATE_FILE}")
     if [[ ${last_collect} =~ ^[0-9]+$ ]] && ((last_collect > 0)); then
-        say "${green}[通过] 已保存采集状态（时间戳 ${last_collect}）${plain}"
+        if config_enabled; then
+            current_epoch=$(now_epoch)
+            if [[ ${current_epoch} =~ ^[0-9]+$ ]] &&
+                ((last_collect <= current_epoch + 60)); then
+                collect_age=$((current_epoch - last_collect))
+                ((collect_age < 0)) && collect_age=0
+                if ((collect_age <= 300)); then
+                    say "${green}[通过] 最近采集正常（${collect_age} 秒前）${plain}"
+                else
+                    say "${red}[失败] 最近采集已过期（${collect_age} 秒前）${plain}"
+                    failures=$((failures + 1))
+                fi
+            else
+                say "${red}[失败] 最近采集时间戳异常：${last_collect}${plain}"
+                failures=$((failures + 1))
+            fi
+        else
+            say "${green}[通过] 已保存采集状态（时间戳 ${last_collect}）${plain}"
+        fi
     else
-        say "${yellow}[警告] 尚无成功采集记录${plain}"
-        warnings=$((warnings + 1))
+        if config_enabled; then
+            say "${red}[失败] 监控已启用但尚无成功采集记录${plain}"
+            failures=$((failures + 1))
+        else
+            say "${yellow}[警告] 尚无成功采集记录${plain}"
+            warnings=$((warnings + 1))
+        fi
     fi
 
     traffic_mode=$(stat -c '%a' "${TRAFFIC_DIR}" 2>/dev/null || printf '?')
