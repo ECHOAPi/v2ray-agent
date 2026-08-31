@@ -1070,6 +1070,8 @@ mkdirTools() {
 
     mkdir -p /etc/v2ray-agent/warp
 
+    mkdir -p /etc/v2ray-agent/traffic
+
     mkdir -p /etc/v2ray-agent/sing-box/conf/config
 
     mkdir -p /usr/share/nginx/html/
@@ -8062,6 +8064,13 @@ removeVMessWSRouting() {
 reloadCore() {
     readInstallType
 
+    local trafficMonitorScript=/etc/v2ray-agent/traffic/traffic_monitor.sh
+    if [[ -x "${trafficMonitorScript}" && -f "/etc/v2ray-agent/traffic/config.json" ]] && jq -e '.enabled == true' /etc/v2ray-agent/traffic/config.json >/dev/null 2>&1; then
+        if ! V2RAY_AGENT_NO_RESTART=1 /bin/bash "${trafficMonitorScript}" sync-config >/dev/null 2>&1; then
+            echoContent red " ---> 用户流量监控配置同步失败，请在用户管理中检查"
+        fi
+    fi
+
     if [[ "${coreInstallType}" == "1" ]]; then
         handleXray stop
         handleXray start
@@ -8721,6 +8730,43 @@ cronFunction() {
         exit 0
     fi
 }
+# 用户流量监控
+trafficMonitorManage() {
+    local repository=${V2RAY_AGENT_REPOSITORY:-mack-a/v2ray-agent}
+    local branch=${V2RAY_AGENT_BRANCH:-master}
+    local trafficMonitorDir=/etc/v2ray-agent/traffic
+    local trafficMonitorScript=${trafficMonitorDir}/traffic_monitor.sh
+    local tempScript=
+    local downloadURL=
+
+    if [[ ! ${repository} =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+        echoContent red " ---> 流量监控脚本仓库格式错误"
+        return
+    fi
+    if [[ ! ${branch} =~ ^[A-Za-z0-9._/-]+$ || ${branch} == *..* ]]; then
+        echoContent red " ---> 流量监控脚本分支格式错误"
+        return
+    fi
+
+    mkdir -p "${trafficMonitorDir}"
+    chmod 700 "${trafficMonitorDir}"
+    tempScript=$(mktemp "${trafficMonitorDir}/traffic_monitor.sh.tmp.XXXXXX")
+    downloadURL="https://raw.githubusercontent.com/${repository}/${branch}/shell/traffic_monitor.sh"
+
+    if wget -q -O "${tempScript}" "${downloadURL}" && /bin/bash -n "${tempScript}"; then
+        chmod 700 "${tempScript}"
+        mv -f "${tempScript}" "${trafficMonitorScript}"
+    else
+        rm -f "${tempScript}"
+        if [[ ! -x "${trafficMonitorScript}" ]]; then
+            echoContent red " ---> 用户流量监控组件下载或校验失败"
+            return
+        fi
+        echoContent yellow " ---> 无法更新流量监控组件，继续使用本地版本"
+    fi
+
+    /bin/bash "${trafficMonitorScript}" menu
+}
 # 账号管理
 manageAccount() {
     echoContent skyBlue "\n功能 1/${totalProgress} : 账号管理"
@@ -8737,6 +8783,7 @@ manageAccount() {
     echoContent yellow "3.管理其他订阅"
     echoContent yellow "4.添加用户"
     echoContent yellow "5.删除用户"
+    echoContent yellow "6.用户流量监控"
     echoContent red "=============================================================="
     read -r -p "请输入:" manageAccountStatus
     if [[ "${manageAccountStatus}" == "1" ]]; then
@@ -8749,6 +8796,8 @@ manageAccount() {
         addUser
     elif [[ "${manageAccountStatus}" == "5" ]]; then
         removeUser
+    elif [[ "${manageAccountStatus}" == "6" ]]; then
+        trafficMonitorManage
     else
         echoContent red " ---> 选择错误"
     fi
