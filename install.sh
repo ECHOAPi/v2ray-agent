@@ -9422,8 +9422,21 @@ subscribe() {
                             wget -O "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" -q "${wgetShowProgressStatus}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/documents/sing-box.json"
                         fi
 
-                        jq ".outbounds=$(jq ".outbounds|map(if has(\"outbounds\") then .outbounds += $(jq ".|map(.tag)" "/etc/v2ray-agent/subscribe_local/sing-box/${email}") else . end)" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}")" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" >"/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" && mv "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}"
-                        jq ".outbounds += $(jq '.' "/etc/v2ray-agent/subscribe_local/sing-box/${email}")" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" >"/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" && mv "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}"
+                        local singBoxTarget="/etc/v2ray-agent/subscribe/sing-box/${emailMd5}"
+                        local singBoxLocal="/etc/v2ray-agent/subscribe_local/sing-box/${email}"
+                        local singBoxTmp="${singBoxTarget}_tmp"
+
+                        jq --slurpfile localNodes "${singBoxLocal}" '
+                            ($localNodes[0] | map(.tag)) as $tags
+                            | .outbounds |= map(
+                                if has("outbounds")
+                                then .outbounds += $tags
+                                else .
+                                end
+                              )
+                            | .outbounds += $localNodes[0]
+                        ' "${singBoxTarget}" >"${singBoxTmp}" &&
+                            mv "${singBoxTmp}" "${singBoxTarget}"
 
                         echoContent skyBlue "\n----------sing-box订阅----------\n"
                         echoContent yellow "url:${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}\n"
