@@ -44,6 +44,7 @@ run_monitor() {
         V2RAY_AGENT_NOW_DATE="${NOW_DATE}" \
         V2RAY_AGENT_NOW_EPOCH="${NOW_EPOCH}" \
         V2RAY_AGENT_STATS_FILE="${STATS_FILE}" \
+        V2RAY_AGENT_TEST_RESTART_FAIL="${V2RAY_AGENT_TEST_RESTART_FAIL:-0}" \
         bash "${MONITOR}" "$@"
 }
 
@@ -60,6 +61,15 @@ write_stats() {
             {name: "inbound>>>VMessWS>>>traffic>>>downlink", value: $d},
             {name: "inbound>>>ADMIN>>>traffic>>>uplink", value: $e},
             {name: "user>>>alice-VLESS>>>traffic>>>uplink", value: 999999}
+        ]
+    }' >"${target}"
+}
+
+write_partial_stats() {
+    local target=$1 value=$2
+    jq -n --argjson value "${value}" '{
+        stat: [
+            {name: "inbound>>>VLESSTCP>>>traffic>>>uplink", value: $value}
         ]
     }' >"${target}"
 }
@@ -99,6 +109,11 @@ assert_jq "${TRAFFIC_DIR}/config.json" '
     .version == 2 and .coverage == "xray-ports"
     and (.ports | type) == "object" and has("users") == false
 ' 'port-only config was not initialized'
+doctor_disabled_output=$(run_monitor doctor)
+grep -q '未启用状态没有残留托管配置' <<<"${doctor_disabled_output}" || {
+    printf '%s\n' "${doctor_disabled_output}" >&2
+    fail 'doctor did not validate a clean disabled state'
+}
 
 # Refuse to expose StatsService on a non-loopback address.
 config_tmp=${TEST_ROOT}/config-unsafe-api.json
@@ -148,12 +163,73 @@ assert_jq "${TRAFFIC_DIR}/state.json" '.ports["443"].disabled == false and has("
 grep -q '端口 443.*达到 80%' "${TRAFFIC_DIR}/alerts.log" || fail 'port threshold alert missing'
 assert_no_file "${XRAY_CONF_DIR}/08_traffic_block_outbound.json"
 
+# A failed Xray restart must roll back every managed config file.
+cp "${XRAY_CONF_DIR}/09_routing.json" "${TEST_ROOT}/routing-before-restart-failure.json"
+state_tmp=${TEST_ROOT}/state-disabled-for-rollback.json
+jq '
+    .ports["443"].disabled = true
+    | .ports["443"].disabled_reasons = ["daily"]
+' "${TRAFFIC_DIR}/state.json" >"${state_tmp}"
+mv "${state_tmp}" "${TRAFFIC_DIR}/state.json"
+V2RAY_AGENT_TEST_RESTART_FAIL=1
+if run_monitor sync-config >/dev/null 2>&1; then
+    fail 'simulated Xray restart failure unexpectedly succeeded'
+fi
+unset V2RAY_AGENT_TEST_RESTART_FAIL
+cmp -s "${TEST_ROOT}/routing-before-restart-failure.json" \
+    "${XRAY_CONF_DIR}/09_routing.json" || fail 'routing config was not rolled back'
+assert_no_file "${XRAY_CONF_DIR}/08_traffic_block_outbound.json"
+state_tmp=${TEST_ROOT}/state-restored-after-rollback.json
+jq '
+    .ports["443"].disabled = false
+    | .ports["443"].disabled_reasons = []
+' "${TRAFFIC_DIR}/state.json" >"${state_tmp}"
+mv "${state_tmp}" "${TRAFFIC_DIR}/state.json"
+
 # Polling the same absolute core counters must not count traffic twice.
 run_monitor collect
 assert_jq "${TRAFFIC_DIR}/state.json" '.ports["443"].total == 1600' \
     'unchanged core counters were counted twice'
 [[ $(grep -c '端口 443.*达到 80%' "${TRAFFIC_DIR}/alerts.log") -eq 1 ]] || \
     fail 'threshold alert was emitted more than once'
+
+# A malformed response must fail closed without changing counters or state.
+STATS_FILE=${TEST_ROOT}/stats-invalid.json
+jq -n '{unexpected: []}' >"${STATS_FILE}"
+if run_monitor collect >/dev/null 2>&1; then
+    fail 'malformed StatsService response was accepted'
+fi
+assert_jq "${TRAFFIC_DIR}/state.json" '
+    .ports["443"].total == 1600
+    and .core_counters["inbound>>>VMessWS>>>traffic>>>downlink"] == 400
+' 'malformed response changed accounting state'
+assert_no_file "${TRAFFIC_DIR}/collect.lock"
+
+# A partial response updates present counters while retaining omitted baselines.
+STATS_FILE=${TEST_ROOT}/stats-partial.json
+write_partial_stats "${STATS_FILE}" 450
+run_monitor collect
+assert_jq "${TRAFFIC_DIR}/state.json" '
+    .ports["443"].total == 1650
+    and .core_counters["inbound>>>VLESSTCP>>>traffic>>>uplink"] == 450
+    and .core_counters["inbound>>>VMessWS>>>traffic>>>downlink"] == 400
+' 'partial response dropped counter baselines or lost its delta'
+
+# Changing a quota should create a new threshold identity, while repeats dedupe.
+config_tmp=${TEST_ROOT}/config-new-limit.json
+jq '.ports["443"].daily_limit = 1900' \
+    "${TRAFFIC_DIR}/config.json" >"${config_tmp}"
+mv "${config_tmp}" "${TRAFFIC_DIR}/config.json"
+run_monitor collect
+[[ $(grep -c '端口 443.*达到' "${TRAFFIC_DIR}/alerts.log") -eq 2 ]] || \
+    fail 'quota change did not refresh threshold alert identity'
+run_monitor collect
+[[ $(grep -c '端口 443.*达到' "${TRAFFIC_DIR}/alerts.log") -eq 2 ]] || \
+    fail 'changed quota threshold alert was not deduplicated'
+config_tmp=${TEST_ROOT}/config-original-limit.json
+jq '.ports["443"].daily_limit = 2000' \
+    "${TRAFFIC_DIR}/config.json" >"${config_tmp}"
+mv "${config_tmp}" "${TRAFFIC_DIR}/config.json"
 
 # A lock left by a dead collector must not stop future collections.
 mkdir "${TRAFFIC_DIR}/collect.lock"
@@ -189,7 +265,7 @@ assert_jq "${XRAY_CONF_DIR}/12_policy.json" '
     and .policy.system.statsInboundUplink == true
     and .policy.system.statsInboundDownlink == true
 ' 'inbound policy settings were not safely merged'
-grep -q '端口 443 已因流量超额自动停用' "${TRAFFIC_DIR}/alerts.log" || \
+grep -q '端口 443 已因流量超额启用黑洞停用' "${TRAFFIC_DIR}/alerts.log" || \
     fail 'automatic port disable alert missing'
 
 # Daily and natural-month periods reset, lifetime remains cumulative.
@@ -216,7 +292,7 @@ assert_jq "${XRAY_CONF_DIR}/09_routing.json" '
         or .outboundTag == "traffic-block"
     )] | length == 0
 ' 'managed block rule was not removed'
-grep -q '端口 443.*自动恢复' "${TRAFFIC_DIR}/alerts.log" || \
+grep -q '端口 443.*黑洞规则已自动移除' "${TRAFFIC_DIR}/alerts.log" || \
     fail 'automatic port recovery alert missing'
 
 # A custom billing quota resets only on its configured billing day.
@@ -262,5 +338,12 @@ assert_file "${report_path}"
 grep -q '"端口"' "${report_path}" || fail 'CSV port header is missing'
 grep -q '443' "${report_path}" || fail 'previous daily report has no port data'
 assert_file "${TRAFFIC_DIR}/reports/daily-2026-08-31.csv"
+
+# The VPS-oriented self-check validates stats, blackhole state, and permissions.
+doctor_output=$(run_monitor doctor)
+grep -q '自检通过' <<<"${doctor_output}" || {
+    printf '%s\n' "${doctor_output}" >&2
+    fail 'doctor command did not pass a consistent monitored state'
+}
 
 printf 'PASS: port traffic monitor tests\n'
