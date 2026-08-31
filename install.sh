@@ -8067,7 +8067,7 @@ reloadCore() {
     local trafficMonitorScript=/etc/v2ray-agent/traffic/traffic_monitor.sh
     if [[ -x "${trafficMonitorScript}" && -f "/etc/v2ray-agent/traffic/config.json" ]] && jq -e '.enabled == true' /etc/v2ray-agent/traffic/config.json >/dev/null 2>&1; then
         if ! V2RAY_AGENT_NO_RESTART=1 /bin/bash "${trafficMonitorScript}" sync-config >/dev/null 2>&1; then
-            echoContent red " ---> 用户流量监控配置同步失败，请在用户管理中检查"
+            echoContent red " ---> 端口流量监控配置同步失败，请在主菜单中检查"
         fi
     fi
 
@@ -8730,7 +8730,7 @@ cronFunction() {
         exit 0
     fi
 }
-# 用户流量监控
+# 端口流量监控
 trafficMonitorManage() {
     local repository=${V2RAY_AGENT_REPOSITORY:-mack-a/v2ray-agent}
     local branch=${V2RAY_AGENT_BRANCH:-master}
@@ -8759,10 +8759,10 @@ trafficMonitorManage() {
     else
         rm -f "${tempScript}"
         if [[ ! -x "${trafficMonitorScript}" ]]; then
-            echoContent red " ---> 用户流量监控组件下载或校验失败"
+            echoContent red " ---> 端口流量监控组件下载或校验失败"
             return
         fi
-        echoContent yellow " ---> 无法更新流量监控组件，继续使用本地版本"
+        echoContent yellow " ---> 无法更新端口流量监控组件，继续使用本地版本"
     fi
 
     /bin/bash "${trafficMonitorScript}" menu
@@ -8783,7 +8783,6 @@ manageAccount() {
     echoContent yellow "3.管理其他订阅"
     echoContent yellow "4.添加用户"
     echoContent yellow "5.删除用户"
-    echoContent yellow "6.用户流量监控"
     echoContent red "=============================================================="
     read -r -p "请输入:" manageAccountStatus
     if [[ "${manageAccountStatus}" == "1" ]]; then
@@ -8796,8 +8795,6 @@ manageAccount() {
         addUser
     elif [[ "${manageAccountStatus}" == "5" ]]; then
         removeUser
-    elif [[ "${manageAccountStatus}" == "6" ]]; then
-        trafficMonitorManage
     else
         echoContent red " ---> 选择错误"
     fi
@@ -10074,6 +10071,7 @@ menu() {
     echoContent yellow "12.添加新端口"
     echoContent yellow "13.BT下载管理"
     echoContent yellow "15.域名黑名单"
+    echoContent yellow "19.端口流量监控"
     echoContent skyBlue "-------------------------版本管理-----------------------------"
     echoContent yellow "16.core管理"
     echoContent yellow "17.更新脚本"
@@ -10138,6 +10136,9 @@ menu() {
         ;;
     18)
         bbrInstall
+        ;;
+    19)
+        trafficMonitorManage
         ;;
     20)
         unInstall 1
