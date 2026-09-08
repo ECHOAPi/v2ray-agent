@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -388,6 +389,189 @@ class BackgroundServiceTests(unittest.TestCase):
         self.assertTrue(readiness["enabled"])
         self.assertTrue(readiness["active"])
         self.assertFalse(self.lock_is_held())
+
+    def failing_service(self, failure, enabled=False, active=False, stop_error=False):
+        state = {"enabled": enabled, "active": active, "cores_active": True}
+        calls = []
+        runner = mock.Mock()
+
+        def run(argv):
+            calls.append(list(argv))
+            operation = argv[1]
+            code, output = 0, ""
+            if operation == "is-enabled":
+                code = 0 if state["enabled"] else 1
+                output = "enabled" if state["enabled"] else "disabled"
+            elif operation == "is-active":
+                code = 0 if state["active"] else 3
+            elif operation == "show":
+                pass
+            elif operation in {"daemon-reload", "enable", "disable"}:
+                self.assertTrue(self.lock_is_held())
+                if operation != "daemon-reload":
+                    state["enabled"] = operation == "enable"
+            elif operation in {"start", "stop"}:
+                self.assertFalse(self.lock_is_held(), "service startup and shutdown must be able to take the writer lock")
+                if operation == "start":
+                    code = 1 if failure == "nonzero" else 0
+                else:
+                    # Model systemd's reverse Requires stop propagation.
+                    if "--job-mode=ignore-dependencies" not in argv:
+                        state["cores_active"] = False
+                    self.assertEqual(argv, ["systemctl", "stop", "--job-mode=ignore-dependencies", cli.Services.unit])
+                    if stop_error:
+                        code = 1
+                    else:
+                        state["active"] = False
+            else:
+                self.fail("unexpected systemctl operation: " + operation)
+            return subprocess.CompletedProcess(argv, code, output, "")
+
+        runner.run.side_effect = run
+        return cli.Services(self.root, runner=runner, unit_root=self.unit_root), state, calls
+
+    def test_cli_first_service_start_failure_removes_new_dependencies_and_enablement(self):
+        for command in (["install-service", "--yes"], ["set-policy", "alpha", "--quota", "1", "--yes"]):
+            for failure in ("nonzero", "inactive"):
+                with self.subTest(command=command[0], failure=failure):
+                    services, state, calls = self.failing_service(failure)
+                    manager = mock.Mock(root=self.root)
+                    manager.list.return_value = [{"port_id": "alpha", "port": 443, "supported": True}]
+                    manager.recover.return_value = []
+                    policies = mock.Mock()
+                    policies.preview.return_value = []
+                    policies.status.return_value = []
+                    output = io.StringIO()
+                    code = cli.main(
+                        ["--root", str(self.root), *command],
+                        manager_factory=lambda *args, **kwargs: manager,
+                        policies_factory=lambda *args, **kwargs: policies,
+                        rates_factory=lambda *args, **kwargs: None,
+                        services_factory=lambda *args, **kwargs: services,
+                        output=output,
+                    )
+                    self.assertEqual(code, 1, output.getvalue())
+                    policies.batch_update.assert_not_called()
+                    self.assertFalse(state["enabled"])
+                    self.assertFalse(state["active"])
+                    self.assertTrue(state["cores_active"], "rollback must not stop live requiring cores")
+                    for path in services.templates():
+                        self.assertFalse(path.exists(), str(path))
+                    mutations = [argv[1] for argv in calls if argv[1] in {"enable", "start", "stop", "disable", "daemon-reload"}]
+                    self.assertEqual(mutations, ["daemon-reload", "enable", "start", "stop", "disable", "daemon-reload"])
+                    self.assertFalse(self.lock_is_held())
+
+    def test_failed_start_preserves_existing_unit_and_prior_enablement(self):
+        for was_enabled in (False, True):
+            with self.subTest(was_enabled=was_enabled):
+                services, state, calls = self.failing_service("nonzero", enabled=was_enabled)
+                unit = self.unit_root / services.unit
+                unit.parent.mkdir(parents=True, exist_ok=True)
+                original = services.templates()[unit]
+                unit.write_text(original)
+                manager = mock.Mock(root=self.root)
+                manager.recover.return_value = []
+                with self.assertRaises(ValueError):
+                    services.ensure(manager)
+                self.assertEqual(unit.read_text(), original)
+                self.assertEqual(state["enabled"], was_enabled)
+                self.assertEqual(state["active"], False)
+                for path in services.templates():
+                    if path != unit:
+                        self.assertFalse(path.exists())
+                if was_enabled:
+                    self.assertFalse(any(argv[1] in {"enable", "disable"} for argv in calls))
+
+    def test_failed_start_does_not_stop_preexisting_active_service(self):
+        services, state, calls = self.failing_service("nonzero", active=True)
+        for path, content in services.templates().items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        manager = mock.Mock(root=self.root)
+        manager.recover.return_value = []
+        with self.assertRaises(ValueError):
+            services.ensure(manager)
+        self.assertTrue(state["active"])
+        self.assertFalse(state["enabled"])
+        self.assertFalse(any(argv[1] == "stop" for argv in calls))
+        self.assertTrue(all(path.read_text() == content for path, content in services.templates().items()))
+
+    def test_cleanup_failure_is_reported_and_other_cleanup_still_runs(self):
+        services, state, calls = self.failing_service("nonzero", stop_error=True)
+        manager = mock.Mock(root=self.root)
+        manager.recover.return_value = []
+        with self.assertRaisesRegex(ValueError, "rollback is incomplete.*systemctl stop"):
+            services.ensure(manager)
+        self.assertFalse(state["enabled"])
+        self.assertTrue(all(not path.exists() for path in services.templates()))
+        self.assertEqual(calls[-1], ["systemctl", "daemon-reload"])
+
+    def test_inherited_writer_lock_rejects_installation_before_mutation(self):
+        services, _, calls = self.failing_service("nonzero")
+        manager = mock.Mock(root=self.root)
+        with open(self.root / ".write.lock", "a+") as owner:
+            fcntl.flock(owner.fileno(), fcntl.LOCK_EX)
+            os.environ["PORT_MANAGER_LOCK_FD"] = str(owner.fileno())
+            with self.assertRaisesRegex(ValueError, "caller's writer lock"):
+                services.ensure(manager)
+            self.assertTrue(self.lock_is_held())
+            self.assertFalse(calls)
+            manager.recover.assert_not_called()
+
+    def test_concurrent_install_waits_for_failed_start_compensation(self):
+        first, state, calls = self.failing_service("nonzero")
+        second = cli.Services(self.root, runner=first.runner, unit_root=self.unit_root)
+        manager = mock.Mock(root=self.root)
+        manager.recover.return_value = []
+        first_started = threading.Event()
+        second_waiting = threading.Event()
+        release_first = threading.Event()
+        original_run = first.runner.run.side_effect
+        original_sleep = cli.time.sleep
+        starts = []
+        results = {}
+
+        def run(argv):
+            if argv[1] == "start":
+                starts.append(argv)
+                if len(starts) == 1:
+                    first_started.set()
+                    if not release_first.wait(2):
+                        raise AssertionError("second installer did not wait")
+                else:
+                    self.assertFalse(self.lock_is_held())
+                    state["active"] = True
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+            return original_run(argv)
+
+        def sleep(seconds):
+            second_waiting.set()
+            original_sleep(seconds)
+
+        def install(name, services):
+            try:
+                results[name] = services.ensure(manager)
+            except BaseException as exc:
+                results[name] = exc
+
+        first.runner.run.side_effect = run
+        threads = [threading.Thread(target=install, args=("first", first)),
+                   threading.Thread(target=install, args=("second", second))]
+        with mock.patch.object(cli.time, "sleep", side_effect=sleep):
+            threads[0].start()
+            self.assertTrue(first_started.wait(2))
+            threads[1].start()
+            try:
+                self.assertTrue(second_waiting.wait(2), "installation lock must span start and rollback")
+            finally:
+                release_first.set()
+                for thread in threads:
+                    thread.join(3)
+        self.assertIsInstance(results.get("first"), ValueError)
+        self.assertEqual(results.get("second"), {"status": "active"})
+        self.assertTrue(state["enabled"])
+        self.assertTrue(state["active"])
+        self.assertTrue(all(path.read_text() == content for path, content in second.templates().items()))
 
     def test_custom_existing_unit_is_preserved_and_service_is_not_started(self):
         unit = self.unit_root / "v2ray-agent-port-policy.service"

@@ -32,12 +32,45 @@ agentWriteUnlock() {
     fi
 }
 agentConfigDigest() {
-    # Policy counters intentionally do not invalidate a legacy input prompt.
-    # Account/config/subscription edits do: stale legacy actions must be retried.
-    find /etc/v2ray-agent/xray /etc/v2ray-agent/sing-box/conf \
-        /etc/v2ray-agent/subscribe /etc/v2ray-agent/subscribe_local \
-        /etc/v2ray-agent/nginx/conf.d /etc/nginx/conf.d \
-        -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum | sha256sum
+    # Hash configuration and credential sources, not logs, cores or Geo assets.
+    # Paths are part of sha256sum output, so additions/deletions also invalidate
+    # a stale menu. Subscription names are opaque and must not be suffix-filtered.
+    (
+        set -o pipefail
+        {
+            local agentPath
+            for agentPath in /etc/v2ray-agent/xray/conf /etc/v2ray-agent/sing-box/conf/config; do
+                [[ -d "$agentPath" ]] || continue
+                find -L "$agentPath" -type f \( -name '*.json' -o -name reality_key \) -print0 || exit 1
+            done
+            agentPath=/etc/v2ray-agent/sing-box/conf/config.json
+            [[ ! -f "$agentPath" ]] || printf '%s\0' "$agentPath"
+            for agentPath in /etc/v2ray-agent/subscribe /etc/v2ray-agent/subscribe_local \
+                /etc/v2ray-agent/nginx/conf.d /etc/nginx/conf.d; do
+                [[ -d "$agentPath" ]] || continue
+                find -L "$agentPath" -type f -print0 || exit 1
+            done
+        } | sort -z | xargs -0 -r sha256sum | sha256sum
+    )
+}
+agentReadOnly() {
+    local agentBefore agentAfter agentResult
+    if [[ ${agentLockHeld:-0} != 1 ]]; then
+        "$@" 9>&-
+        return $?
+    fi
+    agentBefore=$(agentConfigDigest) || return 1
+    agentWriteUnlock || return 1
+    # A long-lived child must not inherit the installer's lock descriptor.
+    "$@" 9>&-
+    agentResult=$?
+    agentWriteLock || exit 1
+    agentAfter=$(agentConfigDigest) || exit 1
+    if [[ "$agentBefore" != "$agentAfter" ]]; then
+        echo "Configuration changed while viewing logs. Retry the operation / 配置已变更，请重新操作。" >&2
+        exit 1
+    fi
+    return "$agentResult"
 }
 read() {
     local agentArg agentPrompt=0 agentBefore agentAfter agentReadResult
@@ -45,12 +78,12 @@ read() {
         [[ "$agentArg" == "-p" ]] && agentPrompt=1
     done
     if [[ ${agentLockHeld:-0} == 1 && ${agentPrompt} == 1 ]]; then
-        agentBefore=$(agentConfigDigest)
+        agentBefore=$(agentConfigDigest) || exit 1
         agentWriteUnlock || return 1
         builtin read "$@"
         agentReadResult=$?
         agentWriteLock || exit 1
-        agentAfter=$(agentConfigDigest)
+        agentAfter=$(agentConfigDigest) || exit 1
         if [[ "$agentBefore" != "$agentAfter" ]]; then
             echo "Configuration changed during input. Retry the operation / 配置已变更，请重新操作。" >&2
             exit 1
@@ -6258,108 +6291,123 @@ addUser() {
     manageAccount 1
 }
 # 移除用户
+# Prepare every account fragment before replacing any live configuration.
+# Caller holds the installer write lock throughout this transaction.
+agentRevokeAccount() {
+    (
+        local source=$1 selected=$2 file candidate backup i committed=false
+        shift 2
+        local -a files=("$@") candidates=() backups=() attempted=()
+        agentAccountCleanup() {
+            local status=$? index
+            trap - EXIT INT TERM
+            if [[ "$committed" != true ]]; then
+                for ((index=${#attempted[@]}-1; index>=0; index--)); do
+                    i=${attempted[index]}
+                    if mv -f -- "${backups[i]}" "${files[i]}"; then
+                        backups[i]=
+                    else
+                        echo "Account rollback failed; restore ${backups[i]} manually. / 账户回滚失败，请用备份恢复。" >&2
+                        backups[i]=
+                        status=1
+                    fi
+                done
+            fi
+            for file in "${candidates[@]}" "${backups[@]}"; do
+                [[ -z "$file" ]] || rm -f -- "$file"
+            done
+            exit "$status"
+        }
+        trap agentAccountCleanup EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        for file in "${files[@]}"; do
+            [[ -f "$file" && ! -L "$file" ]] || exit 1
+            jq -se 'length == 1 and (.[0] | type == "object" and (.inbounds | type == "array") and
+                any(.inbounds[]; (.settings.clients? // .users? | type) == "array"))' "$file" >/dev/null || exit 1
+            candidate=$(mktemp "${file%/*}/.account-candidate.XXXXXX") || exit 1
+            candidates+=("$candidate")
+            backup=$(mktemp "${file%/*}/.account-backup.XXXXXX") || exit 1
+            backups+=("$backup")
+            cp -p -- "$file" "$candidate" && cp -p -- "$file" "$backup" || exit 1
+            # Installer-generated protocols share the credential, not row order.
+            # All jq output goes to a candidate, never to the live fragment.
+            jq --slurpfile source "$source" --argjson selected "$selected" '
+                def credential: .id // .uuid // .password;
+                def accounts: first(.inbounds[] | (.settings.clients? // .users?) | select(type == "array"));
+                def checked:
+                    if type != "array" then error("invalid account array")
+                    elif any(.[]; type != "object") then error("invalid account entry")
+                    elif any(.[]; (credential | type) != "string" or credential == "") then error("missing credential")
+                    else . end;
+                ($source[0] | accounts | .[$selected] | credential) as $credential |
+                if ($credential | type) != "string" or $credential == "" then error("invalid selected account")
+                elif type != "object" or (.inbounds | type) != "array" then error("invalid inbound configuration")
+                else (accounts | checked) as $accounts | .inbounds |= map(
+                    if .settings.clients? != null then
+                        .settings.clients |= (checked | map(select(credential != $credential)))
+                    elif .users? != null then
+                        .users |= (checked | map(select(credential != $credential)))
+                    else . end)
+                end
+            ' "$file" >"$candidate" || exit 1
+            jq -se 'length == 1 and (.[0] | type == "object" and (.inbounds | type == "array"))' "$candidate" >/dev/null || exit 1
+        done
+        for ((i=0; i<${#files[@]}; i++)); do
+            # Include the current file before rename so signals also restore it.
+            attempted+=("$i")
+            mv -f -- "${candidates[i]}" "${files[i]}" || exit 1
+        done
+        committed=true
+    )
+}
+
 removeUser() {
-
-    local uuid=
-    if [[ "${coreInstallType}" == "1" ]]; then
-        jq -r -c '(.inbounds[0].settings.clients // .inbounds[1].settings.clients)[]?|.email' ${configPath}${frontingType:-$frontingTypeReality}.json | awk '{print NR""":"$0}'
-        read -r -p "请选择要删除的用户编号[仅支持单个删除]:" delUserIndex
-        if [[ $(jq -r '(.inbounds[0].settings.clients // .inbounds[1].settings.clients)?|length' ${configPath}${frontingType:-$frontingTypeReality}.json) -lt ${delUserIndex} ]]; then
-            echoContent red " ---> 选择错误"
-        else
-            delUserIndex=$((delUserIndex - 1))
-        fi
-    elif [[ "${coreInstallType}" == "2" ]]; then
-        jq -r -c .inbounds[0].users[].name//.inbounds[0].users[].username ${configPath}${frontingType:-$frontingTypeReality}.json | awk '{print NR""":"$0}'
-        read -r -p "请选择要删除的用户编号[仅支持单个删除]:" delUserIndex
-        if [[ $(jq -r '.inbounds[0].users|length' ${configPath}${frontingType:-$frontingTypeReality}.json) -lt ${delUserIndex} ]]; then
-            echoContent red " ---> 选择错误"
-        else
-            delUserIndex=$((delUserIndex - 1))
-        fi
+    local directory name file previous duplicate source delUserIndex accountCount
+    local -a accountFiles=()
+    local -a accountNames=(
+        02_VLESS_TCP_inbounds 03_VLESS_WS_inbounds 04_trojan_gRPC_inbounds
+        04_trojan_TCP_inbounds 05_VMess_WS_inbounds 06_VLESS_gRPC_inbounds
+        06_hysteria2_inbounds 07_VLESS_vision_reality_inbounds
+        08_VLESS_vision_gRPC_inbounds 09_tuic_inbounds 10_naive_inbounds
+        11_VMess_HTTPUpgrade_inbounds 12_VLESS_XHTTP_inbounds 13_anytls_inbounds
+        20_socks5_inbounds
+    )
+    for directory in "${configPath}" "${singBoxConfigPath}"; do
+        [[ -n "$directory" ]] || continue
+        for name in "${accountNames[@]}"; do
+            file="${directory%/}/${name}.json"
+            [[ -e "$file" || -L "$file" ]] || continue
+            duplicate=false
+            for previous in "${accountFiles[@]}"; do
+                [[ "$file" != "$previous" ]] || duplicate=true
+            done
+            [[ "$duplicate" == true ]] || accountFiles+=("$file")
+        done
+    done
+    if [[ ${#accountFiles[@]} -eq 0 ]]; then
+        echoContent red "No account configuration found. / 未找到账户配置。"
+        return 1
     fi
-
-    if [[ -n "${delUserIndex}" ]]; then
-
-        if echo ${currentInstallProtocolType} | grep -q ",0,"; then
-            local vlessVision
-            vlessVision=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"'])' ${configPath}02_VLESS_TCP_inbounds.json)
-            echo "${vlessVision}" | jq . >${configPath}02_VLESS_TCP_inbounds.json
-        fi
-        if echo ${currentInstallProtocolType} | grep -q ",1,"; then
-            local vlessWSResult
-            vlessWSResult=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"'])' ${configPath}03_VLESS_WS_inbounds.json)
-            echo "${vlessWSResult}" | jq . >${configPath}03_VLESS_WS_inbounds.json
-        fi
-
-        if echo ${currentInstallProtocolType} | grep -q ",2,"; then
-            local trojangRPCUsers
-            trojangRPCUsers=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"')' ${configPath}04_trojan_gRPC_inbounds.json)
-            echo "${trojangRPCUsers}" | jq . >${configPath}04_trojan_gRPC_inbounds.json
-        fi
-
-        if echo ${currentInstallProtocolType} | grep -q ",3,"; then
-            local vmessWSResult
-            vmessWSResult=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"'])' ${configPath}05_VMess_WS_inbounds.json)
-            echo "${vmessWSResult}" | jq . >${configPath}05_VMess_WS_inbounds.json
-        fi
-
-        if echo ${currentInstallProtocolType} | grep -q ",5,"; then
-            local vlessGRPCResult
-            vlessGRPCResult=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"'])' ${configPath}06_VLESS_gRPC_inbounds.json)
-            echo "${vlessGRPCResult}" | jq . >${configPath}06_VLESS_gRPC_inbounds.json
-        fi
-
-        if echo ${currentInstallProtocolType} | grep -q ",4,"; then
-            local trojanTCPResult
-            trojanTCPResult=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"'])' ${configPath}04_trojan_TCP_inbounds.json)
-            echo "${trojanTCPResult}" | jq . >${configPath}04_trojan_TCP_inbounds.json
-        fi
-
-        if echo ${currentInstallProtocolType} | grep -q ",6,"; then
-            local hysteriaResult
-            hysteriaResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}06_hysteria2_inbounds.json")
-            echo "${hysteriaResult}" | jq . >"${singBoxConfigPath}06_hysteria2_inbounds.json"
-        fi
-        if echo ${currentInstallProtocolType} | grep -q ",7,"; then
-            local vlessRealityResult
-            vlessRealityResult=$(jq -r 'del(.inbounds[1].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"'])' ${configPath}07_VLESS_vision_reality_inbounds.json)
-            echo "${vlessRealityResult}" | jq . >${configPath}07_VLESS_vision_reality_inbounds.json
-        fi
-        if echo ${currentInstallProtocolType} | grep -q ",8,"; then
-            local vlessRealityGRPCResult
-            vlessRealityGRPCResult=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"'])' ${configPath}08_VLESS_vision_gRPC_inbounds.json)
-            echo "${vlessRealityGRPCResult}" | jq . >${configPath}08_VLESS_vision_gRPC_inbounds.json
-        fi
-
-        if echo ${currentInstallProtocolType} | grep -q ",9,"; then
-            local tuicResult
-            tuicResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}09_tuic_inbounds.json")
-            echo "${tuicResult}" | jq . >"${singBoxConfigPath}09_tuic_inbounds.json"
-        fi
-        if echo ${currentInstallProtocolType} | grep -q ",10,"; then
-            local naiveResult
-            naiveResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}10_naive_inbounds.json")
-            echo "${naiveResult}" | jq . >"${singBoxConfigPath}10_naive_inbounds.json"
-        fi
-        # VMess HTTPUpgrade
-        if echo ${currentInstallProtocolType} | grep -q ",11,"; then
-            local vmessHTTPUpgradeResult
-            vmessHTTPUpgradeResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}11_VMess_HTTPUpgrade_inbounds.json")
-            echo "${vmessHTTPUpgradeResult}" | jq . >"${singBoxConfigPath}11_VMess_HTTPUpgrade_inbounds.json"
-            echo "${vmessHTTPUpgradeResult}" | jq . >${configPath}11_VMess_HTTPUpgrade_inbounds.json
-        fi
-        # AnyTLS
-        if echo ${currentInstallProtocolType} | grep -q ",13,"; then
-            local anyTLSResult
-            anyTLSResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}13_anytls_inbounds.json")
-            echo "${anyTLSResult}" | jq . >"${singBoxConfigPath}13_anytls_inbounds.json"
-        fi
-        reloadCore
-        readNginxSubscribe
-        if [[ -n "${subscribePort}" ]]; then
-            subscribe false
-        fi
+    source="${configPath%/}/${frontingType:-$frontingTypeReality}.json"
+    [[ -f "$source" && ! -L "$source" ]] || source=${accountFiles[0]}
+    jq -se 'length == 1 and (.[0] | type == "object" and (.inbounds | type == "array"))' "$source" >/dev/null || return 1
+    accountCount=$(jq -er 'first(.inbounds[] | (.settings.clients? // .users?) | select(type == "array")) | length' "$source") || return 1
+    jq -r 'first(.inbounds[] | (.settings.clients? // .users?) | select(type == "array")) | to_entries[] | "\(.key + 1):\(.value.email // .value.name // .value.username // "unnamed")"' "$source" || return 1
+    read -r -p "请选择要删除的用户编号[仅支持单个删除]:" delUserIndex || return 1
+    # Validate text before arithmetic; reject expressions, zero and huge values.
+    if [[ ! "$delUserIndex" =~ ^[1-9][0-9]{0,8}$ ]] || ((delUserIndex > accountCount)); then
+        echoContent red "Invalid user number. / 用户编号无效。"
+        return 1
+    fi
+    if ! agentRevokeAccount "$source" "$((delUserIndex - 1))" "${accountFiles[@]}"; then
+        echoContent red "Account deletion failed; check the configuration and rollback messages. / 删除失败，请检查配置及回滚提示。"
+        return 1
+    fi
+    reloadCore || return 1
+    readNginxSubscribe || return 1
+    if [[ -n "${subscribePort}" ]]; then
+        subscribe false || return 1
     fi
     manageAccount 1
 }
@@ -6497,10 +6545,10 @@ EOF
         checkLog 1
         ;;
     2)
-        tail -f "${configPathLog}access.log"
+        agentReadOnly tail -f "${configPathLog}access.log"
         ;;
     3)
-        tail -f "${configPathLog}error.log"
+        agentReadOnly tail -f "${configPathLog}error.log"
         ;;
     4)
         if [[ ! -f "/etc/v2ray-agent/crontab_tls.log" ]]; then
@@ -10088,10 +10136,10 @@ singBoxVersionManageMenu() {
     elif [[ "${selectSingBoxType}" == "5" ]]; then
         singBoxLog ${logStatus}
         if [[ "${logStatus}" == "false" ]]; then
-            tail -f "${singBoxConfigPath}../box.log"
+            agentReadOnly tail -f "${singBoxConfigPath}../box.log"
         fi
     elif [[ "${selectSingBoxType}" == "6" ]]; then
-        tail -f "${singBoxConfigPath}../box.log"
+        agentReadOnly tail -f "${singBoxConfigPath}../box.log"
     fi
 }
 
@@ -10100,7 +10148,7 @@ menu() {
     cd "$HOME" || exit
     echoContent red "\n=============================================================="
     echoContent green "作者：mack-a"
-    echoContent green "当前版本：v3.5.24-port.1"
+    echoContent green "当前版本：v3.5.24-port.2"
     echoContent green "Github：https://github.com/ECHOAPi/v2ray-agent"
     echoContent green "描述：八合一共存脚本\c"
     showInstallStatus
