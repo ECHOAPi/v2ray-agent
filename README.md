@@ -5,7 +5,7 @@
 
 基于 [mack-a/v2ray-agent](https://github.com/mack-a/v2ray-agent) 的 Xray-core / sing-box 管理脚本。本仓库保留原有安装、协议、账户和订阅管理能力，并将主菜单 **12「添加新端口」升级为「端口管理」**。
 
-当前脚本版本：`v3.5.24-port.2`。本轮修正日志查看持锁、交互摘要误报、首次后台服务启动失败补偿，以及删除账户时的 XHTTP 遗漏和 Trojan gRPC 配置清空。真实核心、内核规则和客户端验收仍待完成；单端口限速为实验性功能。
+当前脚本版本：`v3.5.24-port.3`。本轮阻止账户撤销将辅助 SOCKS5 入口变成免认证，修正客户端默认安全、换 Salt 后旧订阅撤销和辅助 TLS 备份；自更新及模块下载改为解锁准备、核对后提交。真实核心、内核规则和客户端验收仍待完成；单端口限速为实验性功能。
 
 ## 本版新增
 
@@ -59,6 +59,8 @@ curl --fail --location --proto '=https' --tlsv1.2 "https://raw.githubusercontent
 
 主菜单 **17「更新脚本」** 从 `ECHOAPi/v2ray-agent` 获取更新。端口管理模块使用安装器中记录的固定提交，避免混用不同版本；下载或校验失败时保留旧脚本，成功替换时保留 `install.sh.previous`。
 
+脚本和模块下载期间不占用共用写锁，后台可继续核对策略。提交前重新检查配置、已安装脚本和模块指针；发现其他操作已改变这些内容时，本次更新会失败退出，请重新运行。普通脚本替换失败会尝试恢复原模块指针。
+
 首次进入端口管理会安装对应的模块。首次使用额度、到期或限速功能时，菜单会提示确认安装后台服务及核心启动依赖，不需要重装协议或重新创建账户。
 
 ## 端口管理菜单
@@ -102,9 +104,13 @@ curl --fail --location --proto '=https' --tlsv1.2 "https://raw.githubusercontent
 
 **限速仍有实质边界：** 当前 flower 端口分类不能覆盖非首个 IP 分片，因此尚不能保证严格的端口带宽上限。首次接入只接受空/noqueue 或本模块已拥有的队列结构；`mq`、`fq_codel`、未知 QoS 和多个外部接口会被拒绝。`applied=true` 仅表示对象安装核验通过，不代表真实吞吐验收通过。
 
-**策略刷新仍受旧写入流程影响：** 日志跟随和等待输入已释放共用写锁；核心下载、升级等旧流程仍可能长时间持锁，阻塞后台刷新。超过 30 秒策略有效期后，纳管入口可能被保守阻断。这一 R01 剩余问题尚未关闭。
+**策略刷新仍受旧写入流程影响：** 日志跟随、等待输入、自更新和模块下载已释放共用写锁；Xray/sing-box 核心升级、Geo 更新、订阅远程模板下载等其他旧流程仍可能长时间持锁，阻塞后台刷新。超过 30 秒策略有效期后，纳管入口可能被保守阻断。这一 R01 剩余问题尚未关闭。
 
-本轮账户修正针对删除路径，不代表全部账户、订阅和更新流程已完成整改。客户端默认安全、旧 Salt 订阅撤销、辅助脚本及其他审计遗留项仍待处理；逐项范围见 [复核修正记录](documents/audit-followup-2026-09-08.md)。
+删除主账户会联动使用相同凭证的辅助入口。如果将删空 SOCKS、HTTP 或 mixed 入站的认证用户列表，整批删除会被拒绝并保留原配置。请先为辅助入口设置独立凭证或禁用该入口，再重新删除。
+
+新生成的 Clash 完整配置默认只允许本机访问代理、管理接口及 DNS；Trojan gRPC 的 sing-box 订阅恢复证书校验。已下载的旧配置需要重新拉取。换 Salt 时先准备新订阅，再撤销五种格式的旧生成地址；普通发布失败尝试补偿，中断后若保留恢复目录会明确提示。订阅生成现在需要 Python 3。
+
+这些改动不代表全部账户、订阅和更新流程已完成整改。剩余审计项及准确验证范围见 [本轮安全修正记录](documents/security-followup-5748474d-2026-09-08.md)。
 
 旧防火墙放行规则采用保留策略，不会清空整机规则。异常断电或计数器代次丢失会保留可信用量并采取保守限制；目前没有完整的全量退役和普通用户故障校正向导，不应直接删除账本、规则表或队列解除限制。
 
@@ -112,13 +118,14 @@ curl --fail --location --proto '=https' --tlsv1.2 "https://raw.githubusercontent
 
 ## 测试与验证
 
-本轮 **150 项本地隔离回归全部通过**，包含实际日志菜单、完整输入包装、CLI 服务失败和跨协议账户删除；结果记录在 [复核修正记录](documents/audit-followup-2026-09-08.md)。云端 CI 状态见页首徽章及对应提交的检查页。测试使用临时目录、合成账户和模拟系统执行器，没有操作实际代理服务器。真实核心、内核流量、双栈、重启/断电和客户端验收尚待完成。
+本轮 **186 项本地隔离回归全部通过**，增加认证删空、慢下载并发续期、实际客户端生成器、Salt 撤销及私有 TLS 备份测试，完整结果见 [本轮安全修正记录](documents/security-followup-5748474d-2026-09-08.md)。云端 CI 状态见页首徽章及对应提交的检查页。测试使用临时目录、合成账户和模拟系统执行器，没有操作实际代理服务器。真实核心、内核流量、双栈、重启/断电和客户端验收尚待完成。
 
 在仓库目录复现：
 
 ```bash
 bash -n install.sh
 bash -n shell/install_en.sh
+bash -n shell/init_tls.sh
 PYTHONPATH=shell python3 -m unittest discover -s tests -p 'test_port*.py' -q
 ```
 
@@ -129,6 +136,7 @@ PYTHONPATH=shell python3 -m unittest discover -s tests -p 'test_port*.py' -q
 - [端口管理使用说明、支持范围与恢复步骤](documents/port-management.md)
 - [端口管理实施验证记录](documents/port-management-validation.md)
 - [2026-09-08 复核修正范围与剩余问题](documents/audit-followup-2026-09-08.md)
+- [5748474d 后的安全修正与验证](documents/security-followup-5748474d-2026-09-08.md)
 - [提交本修改版的问题](https://github.com/ECHOAPi/v2ray-agent/issues)
 - [本仓库 CI](https://github.com/ECHOAPi/v2ray-agent/actions)
 - [上游基础使用教程](https://www.v2ray-agent.com/archives/1710141233)

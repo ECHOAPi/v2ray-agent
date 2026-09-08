@@ -92,39 +92,109 @@ read() {
     fi
     builtin read "$@"
 }
-portManagerInstallPackage() {
-    local revision=$1 destination staging name
-    [[ "$revision" =~ ^[a-f0-9]{40}$ ]] || { echo "Invalid port manager revision." >&2; return 1; }
-    command -v python3 >/dev/null || { echo "Install python3 and python3-yaml first." >&2; return 1; }
-    python3 -c 'import sys, sqlite3, yaml, zoneinfo; assert sys.version_info >= (3, 9)' || return 1
-    destination="/etc/v2ray-agent/port-manager-lib/${revision}"
-    if [[ ! -f "${destination}/.complete" ]]; then
-        install -d -m 700 /etc/v2ray-agent/port-manager-lib || return 1
-        staging=$(mktemp -d /etc/v2ray-agent/port-manager-lib/.candidate.XXXXXX) || return 1
-        install -d -m 700 "${staging}/port_manager" || return 1
-        for name in __init__.py __main__.py core.py subscriptions.py policies.py rate_limits.py; do
-            if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-                --connect-timeout 15 --max-time 120 \
-                "https://raw.githubusercontent.com/ECHOAPi/v2ray-agent/${revision}/shell/port_manager/${name}" \
-                -o "${staging}/port_manager/${name}"; then
-                rm -rf -- "$staging"
+agentPreparationDigest() {
+    (
+        set -o pipefail
+        {
+            agentConfigDigest || exit 1
+            if [[ -e /etc/v2ray-agent/install.sh || -L /etc/v2ray-agent/install.sh ]]; then
+                [[ -f /etc/v2ray-agent/install.sh && ! -L /etc/v2ray-agent/install.sh ]] || exit 1
+                sha256sum /etc/v2ray-agent/install.sh || exit 1
+            fi
+            if [[ -L /etc/v2ray-agent/port-manager-lib/current ]]; then
+                readlink /etc/v2ray-agent/port-manager-lib/current || exit 1
+            elif [[ -e /etc/v2ray-agent/port-manager-lib/current ]]; then
                 return 1
             fi
-        done
-        chmod 600 "${staging}/port_manager/"*.py
-        if ! python3 -m compileall -q "${staging}/port_manager"; then
+        } | sha256sum
+    )
+}
+agentPrepare() {
+    # Only caller-owned temporary files may be written by the callback.
+    # Active configurations, script and module pointer are checked before commit.
+    local before after result
+    agentWriteLock || return 1
+    before=$(agentPreparationDigest) || return 1
+    agentWriteUnlock || return 1
+    "$@" 9>&-
+    result=$?
+    agentWriteLock || exit 1
+    after=$(agentPreparationDigest) || return 1
+    if [[ "$before" != "$after" ]]; then
+        echo "Configuration or installed script changed during preparation; retry. / 准备期间配置或脚本已变化，请重新操作。" >&2
+        return 1
+    fi
+    return "$result"
+}
+portManagerPackageReady() {
+    local revision=$1 name destination="/etc/v2ray-agent/port-manager-lib/$1"
+    [[ "$revision" =~ ^[a-f0-9]{40}$ ]] || return 1
+    [[ -d "$destination" && ! -L "$destination" && -f "$destination/.complete" && ! -L "$destination/.complete" ]] || return 1
+    [[ -d "$destination/port_manager" && ! -L "$destination/port_manager" ]] || return 1
+    for name in __init__.py __main__.py core.py subscriptions.py policies.py rate_limits.py; do
+        [[ -f "$destination/port_manager/$name" && ! -L "$destination/port_manager/$name" ]] || return 1
+    done
+}
+portManagerDownloadPackage() {
+    local revision=$1 staging=$2 name
+    install -d -m 700 "$staging/port_manager" || return 1
+    for name in __init__.py __main__.py core.py subscriptions.py policies.py rate_limits.py; do
+        curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 15 --max-time 120 \
+            "https://raw.githubusercontent.com/ECHOAPi/v2ray-agent/${revision}/shell/port_manager/${name}" \
+            -o "$staging/port_manager/$name" || return 1
+    done
+    chmod 600 "$staging/port_manager/"*.py || return 1
+    python3 -m compileall -q "$staging/port_manager" || return 1
+    (umask 077; touch "$staging/.complete")
+}
+portManagerActivatePackage() {
+    local revision=$1 linkStage previous
+    portManagerPackageReady "$revision" || return 1
+    if [[ -L /etc/v2ray-agent/port-manager-lib/current ]]; then
+        previous=$(readlink /etc/v2ray-agent/port-manager-lib/current) || return 1
+        [[ "$previous" =~ ^[a-f0-9]{40}$ ]] || return 1
+    elif [[ -e /etc/v2ray-agent/port-manager-lib/current ]]; then
+        echo "Unknown module pointer; refusing replacement." >&2
+        return 1
+    fi
+    linkStage=$(mktemp -d /etc/v2ray-agent/port-manager-lib/.link.XXXXXX) || return 1
+    if ! ln -s "$revision" "$linkStage/current" || \
+        ! mv -Tf "$linkStage/current" /etc/v2ray-agent/port-manager-lib/current; then
+        rm -rf -- "$linkStage"
+        return 1
+    fi
+    rmdir "$linkStage"
+}
+portManagerInstallPackage() {
+    local revision=$1 mode=${2:-activate} destination staging
+    [[ "$revision" =~ ^[a-f0-9]{40}$ ]] || { echo "Invalid port manager revision." >&2; return 1; }
+    [[ "$mode" == activate || "$mode" == prepare ]] || return 1
+    command -v python3 >/dev/null || { echo "Install python3 and python3-yaml first." >&2; return 1; }
+    python3 -c 'import sys, sqlite3, yaml, zoneinfo; assert sys.version_info >= (3, 9)' || return 1
+    agentWriteLock || return 1
+    destination="/etc/v2ray-agent/port-manager-lib/${revision}"
+    [[ ! -L /etc/v2ray-agent/port-manager-lib ]] || return 1
+    install -d -m 700 /etc/v2ray-agent/port-manager-lib || return 1
+    if ! portManagerPackageReady "$revision"; then
+        if [[ -e "$destination" || -L "$destination" ]]; then
+            echo "Incomplete or untrusted module cache; refusing replacement." >&2
+            return 1
+        fi
+        staging=$(mktemp -d /etc/v2ray-agent/port-manager-lib/.candidate.XXXXXX) || return 1
+        if ! agentPrepare portManagerDownloadPackage "$revision" "$staging"; then
             rm -rf -- "$staging"
             return 1
         fi
-        touch "${staging}/.complete"
-        mv -- "$staging" "$destination" || return 1
+        # Another preparer may have published this immutable revision while unlocked.
+        if portManagerPackageReady "$revision"; then
+            rm -rf -- "$staging"
+        elif [[ -e "$destination" || -L "$destination" ]] || ! mv -T -- "$staging" "$destination"; then
+            rm -rf -- "$staging"
+            return 1
+        fi
     fi
-    # A versioned directory keeps an unsuccessful update from damaging old code.
-    local linkStage
-    linkStage=$(mktemp -d /etc/v2ray-agent/port-manager-lib/.link.XXXXXX) || return 1
-    ln -s "$revision" "${linkStage}/current" || return 1
-    mv -Tf "${linkStage}/current" /etc/v2ray-agent/port-manager-lib/current || return 1
-    rmdir "$linkStage"
+    [[ "$mode" == prepare ]] || portManagerActivatePackage "$revision"
 }
 portManager() {
     local packagePath="/etc/v2ray-agent/port-manager-lib/${PORT_MANAGER_REVISION}"
@@ -5199,7 +5269,7 @@ EOF
       grpc-service-name: ${currentPath}trojangrpc
 EOF
 
-        singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"trojan\",\"server\":\"${add}\",\"server_port\":${port},\"password\":\"${id}\",\"tls\":{\"enabled\":true,\"server_name\":\"${currentHost}\",\"insecure\":true,\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"}},\"transport\":{\"type\":\"grpc\",\"service_name\":\"${currentPath}trojangrpc\",\"idle_timeout\":\"15s\",\"ping_timeout\":\"15s\",\"permit_without_stream\":false},\"multiplex\":{\"enabled\":false,\"protocol\":\"smux\",\"max_streams\":32}}]" "/etc/v2ray-agent/subscribe_local/sing-box/${user}")
+        singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"trojan\",\"server\":\"${add}\",\"server_port\":${port},\"password\":\"${id}\",\"tls\":{\"enabled\":true,\"server_name\":\"${currentHost}\",\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"}},\"transport\":{\"type\":\"grpc\",\"service_name\":\"${currentPath}trojangrpc\",\"idle_timeout\":\"15s\",\"ping_timeout\":\"15s\",\"permit_without_stream\":false},\"multiplex\":{\"enabled\":false,\"protocol\":\"smux\",\"max_streams\":32}}]" "/etc/v2ray-agent/subscribe_local/sing-box/${user}")
         echo "${singBoxSubscribeLocalConfig}" | jq . >"/etc/v2ray-agent/subscribe_local/sing-box/${user}"
 
         echoContent yellow "Please enter custom UUID [need to be legal], [Enter] random UUID"
@@ -6320,7 +6390,14 @@ agentRevokeAccount() {
                     if .settings.clients? != null then
                         .settings.clients |= (checked | map(select(credential != $credential)))
                     elif .users? != null then
-                        .users |= (checked | map(select(credential != $credential)))
+                        (.users | checked) as $users |
+                        ($users | map(select(credential != $credential))) as $remaining |
+                        # Empty users disables authentication for these sing-box types.
+                        # Reject while preparing candidates, before publishing any file.
+                        if ((.type == "socks" or .type == "http" or .type == "mixed") and
+                            ($users | length) > 0 and ($remaining | length) == 0) then
+                            error("Account deletion refused: removing the last SOCKS/HTTP/mixed user would disable authentication. First assign independent credentials to or disable the auxiliary inbound. / 拒绝删除辅助 SOCKS/HTTP/mixed 入口的最后一个用户；请先为该入口改用独立凭证或禁用该入口。")
+                        else .users = $remaining end
                     else . end)
                 end
             ' "$file" >"$candidate" || exit 1
@@ -6385,28 +6462,52 @@ removeUser() {
     manageAccount 1
 }
 # update script
-updateV2RayAgent() {
-    local candidate revision scriptPath="shell/install_en.sh"
-    echoContent skyBlue "Updating ECHOAPi/v2ray-agent / 更新脚本"
-    candidate=$(mktemp /etc/v2ray-agent/.install.XXXXXX) || return 1
-    if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+agentDownloadScript() {
+    local candidate=$1 scriptPath=$2
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
         --connect-timeout 15 --max-time 120 \
-        "https://raw.githubusercontent.com/ECHOAPi/v2ray-agent/master/${scriptPath}" -o "$candidate" \
-        || ! bash -n "$candidate"; then
+        "https://raw.githubusercontent.com/ECHOAPi/v2ray-agent/master/${scriptPath}" -o "$candidate" && bash -n "$candidate"
+}
+updateV2RayAgent() {
+    local candidate revision backup previous="" scriptPath="shell/install_en.sh"
+    echoContent skyBlue "Updating ECHOAPi/v2ray-agent / 更新脚本"
+    agentWriteLock || return 1
+    candidate=$(mktemp /etc/v2ray-agent/.install.XXXXXX) || return 1
+    if ! agentPrepare agentDownloadScript "$candidate" "$scriptPath"; then
         rm -f -- "$candidate"
         echoContent red "Update failed; previous script retained. / 更新失败，已保留旧脚本。"
         return 1
     fi
     revision=$(sed -n 's/^PORT_MANAGER_REVISION="\([a-f0-9]\{40\}\)"$/\1/p' "$candidate")
-    if ! portManagerInstallPackage "$revision"; then
+    # Downloads only populate a private candidate/cache; keep the active pointer
+    # on the old revision until the script and module are ready to commit.
+    if ! portManagerInstallPackage "$revision" prepare || ! chmod 700 "$candidate"; then
         rm -f -- "$candidate"
         return 1
     fi
-    chmod 700 "$candidate" || return 1
-    if [[ -f /etc/v2ray-agent/install.sh ]]; then
-        cp -p /etc/v2ray-agent/install.sh /etc/v2ray-agent/install.sh.previous || return 1
+    if [[ -L /etc/v2ray-agent/port-manager-lib/current ]]; then
+        previous=$(readlink /etc/v2ray-agent/port-manager-lib/current) || { rm -f -- "$candidate"; return 1; }
     fi
-    mv -f -- "$candidate" /etc/v2ray-agent/install.sh || return 1
+    if [[ -f /etc/v2ray-agent/install.sh ]]; then
+        backup=$(mktemp /etc/v2ray-agent/.install-backup.XXXXXX) || { rm -f -- "$candidate"; return 1; }
+        if ! cp -p -- /etc/v2ray-agent/install.sh "$backup" || ! mv -f -- "$backup" /etc/v2ray-agent/install.sh.previous; then
+            rm -f -- "$candidate" "$backup"
+            return 1
+        fi
+    fi
+    if ! portManagerActivatePackage "$revision"; then
+        rm -f -- "$candidate"
+        return 1
+    fi
+    if ! mv -f -- "$candidate" /etc/v2ray-agent/install.sh; then
+        if [[ -n "$previous" ]]; then
+            portManagerActivatePackage "$previous" || echo "Module pointer rollback failed. / 模块指针回滚失败。" >&2
+        else
+            rm -f -- /etc/v2ray-agent/port-manager-lib/current
+        fi
+        rm -f -- "$candidate"
+        return 1
+    fi
     systemctl try-restart --no-block v2ray-agent-port-policy.service >/dev/null 2>&1 || true
     echoContent green "Update complete. Run vasma again. / 更新完成，请重新运行 vasma。"
     exit 0
@@ -8990,18 +9091,18 @@ addOtherSubscribe() {
 clashMetaConfig() {
     local url=$1
     local id=$2
-    cat <<EOF >"/etc/v2ray-agent/subscribe/clashMetaProfiles/${id}"
+    cat <<EOF >"${subscriptionOutputRoot:-/etc/v2ray-agent/subscribe}/clashMetaProfiles/${id}"
 log-level: debug
 mode: rule
 ipv6: true
 mixed-port: 7890
-allow-lan: true
-bind-address: "*"
+allow-lan: false
+bind-address: "127.0.0.1"
 lan-allowed-ips:
-  - 0.0.0.0/0
-  - ::/0
+  - 127.0.0.1/32
+  - ::1/128
 find-process-mode: strict
-external-controller: 0.0.0.0:9090
+external-controller: 127.0.0.1:9090
 
 geox-url:
   geoip: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat"
@@ -9011,7 +9112,7 @@ geo-auto-update: true
 geo-update-interval: 24
 
 external-controller-cors:
-  allow-private-network: true
+  allow-private-network: false
 
 global-client-fingerprint: chrome
 
@@ -9034,7 +9135,7 @@ sniffer:
 dns:
   enable: true
   prefer-h3: false
-  listen: 0.0.0.0:1053
+  listen: 127.0.0.1:1053
   ipv6: true
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
@@ -9386,6 +9487,206 @@ initRandomSalt() {
     echo "${initCustomPath}"
 }
 # Subscribe
+# Build privately; publishing and revocation happen only after all outputs exist.
+agentGenerateSubscriptions() {
+    local email emailMd5 currentDomain format base64Result
+    for format in default clashMeta sing-box; do
+        rm -f -- /etc/v2ray-agent/subscribe_local/"${format}"/* || return 1
+    done
+    showAccounts >/dev/null || return 1
+    local generated=0
+    for email in /etc/v2ray-agent/subscribe_local/default/*; do
+        [[ -f "$email" ]] || continue
+        email=${email##*/}
+        emailMd5=$(printf '%s\n' "${email}${subscribeSalt}" | md5sum | awk '{print $1}') || return 1
+        cat "/etc/v2ray-agent/subscribe_local/default/${email}" >"${subscriptionOutputRoot}/default/${emailMd5}" || return 1
+        if [[ "${updateOtherSubscribeStatus}" == "y" ]]; then
+            updateRemoteSubscribe "${emailMd5}" "${email}" || return 1
+        fi
+        base64Result=$(base64 -w 0 "${subscriptionOutputRoot}/default/${emailMd5}") || return 1
+        printf '%s\n' "$base64Result" >"${subscriptionOutputRoot}/default/${emailMd5}" || return 1
+        currentDomain=${currentHost}
+        if [[ -n "${currentDefaultPort}" && "${currentDefaultPort}" != "443" ]]; then
+            currentDomain="${currentHost}:${currentDefaultPort}"
+        fi
+        if [[ -n "${subscribePort}" ]]; then
+            if [[ "${subscribeType}" == "http" ]]; then
+                currentDomain="$(getPublicIP):${subscribePort}"
+            else
+                currentDomain="${currentHost}:${subscribePort}"
+            fi
+        fi
+        if [[ -f "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" ]]; then
+            cat "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" >>"${subscriptionOutputRoot}/clashMeta/${emailMd5}" || return 1
+            sed -i '1i\proxies:' "${subscriptionOutputRoot}/clashMeta/${emailMd5}" || return 1
+            clashMetaConfig "${subscribeType}://${currentDomain}/s/clashMeta/${emailMd5}" "${emailMd5}" || return 1
+        fi
+        if [[ -f "/etc/v2ray-agent/subscribe_local/sing-box/${email}" ]]; then
+            cp "/etc/v2ray-agent/subscribe_local/sing-box/${email}" "${subscriptionOutputRoot}/sing-box_profiles/${emailMd5}" || return 1
+            wget -O "${subscriptionOutputRoot}/sing-box/${emailMd5}" -q \
+                "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/documents/sing-box.json" || return 1
+            jq --slurpfile nodes "${subscriptionOutputRoot}/sing-box_profiles/${emailMd5}" \
+                'if (.outbounds | type) != "array" or ($nodes[0] | type) != "array" then error("Invalid sing-box subscription") else
+                 .outbounds |= (map(if has("outbounds") then .outbounds += ($nodes[0] | map(.tag)) else . end) + $nodes[0]) end' \
+                "${subscriptionOutputRoot}/sing-box/${emailMd5}" >"${subscriptionOutputRoot}/sing-box/${emailMd5}_tmp" || return 1
+            mv "${subscriptionOutputRoot}/sing-box/${emailMd5}_tmp" "${subscriptionOutputRoot}/sing-box/${emailMd5}" || return 1
+        fi
+        generated=$((generated + 1))
+        if [[ -z "${showStatus}" ]]; then
+            echoContent green "email:${email}"
+            for format in default clashMetaProfiles sing-box; do
+                [[ -f "${subscriptionOutputRoot}/${format}/${emailMd5}" ]] || continue
+                echoContent yellow "${format}: ${subscribeType}://${currentDomain}/s/${format}/${emailMd5}"
+                if [[ "${release}" != "alpine" ]]; then
+                    printf '%s\n' "${subscribeType}://${currentDomain}/s/${format}/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
+                fi
+            done
+        fi
+    done
+    [[ "$generated" -gt 0 ]] || { echo "No account subscriptions generated / 未生成账号订阅。" >&2; return 1; }
+}
+# Compensates ordinary I/O failures. This is not a crash-atomic multi-file transaction.
+agentPublishSubscriptions() {
+    python3 - "$1" /etc/v2ray-agent <<'PY'
+import base64
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import sys
+
+stage, root = map(Path, sys.argv[1:])
+formats = ("default", "clashMeta", "clashMetaProfiles", "sing-box", "sing-box_profiles")
+public = root / "subscribe"
+salt = root / "subscribe_local" / "subscribeSalt"
+backup = stage / "backup"
+marker = stage / "KEEP_RECOVERY"
+changed = []
+originals = {}
+interrupts = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def interrupted(signum, frame):
+    raise InterruptedError("Subscription publication interrupted by signal " + str(signum))
+
+
+def sync_file(path):
+    with path.open("rb") as stream:
+        os.fsync(stream.fileno())
+
+
+for signum in interrupts:
+    signal.signal(signum, interrupted)
+try:
+    for directory in (root, public, salt.parent):
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("Unsafe subscription directory: " + str(directory))
+    candidates = {}
+    existing = {}
+    for fmt in formats:
+        target = public / fmt
+        if target.is_symlink() or not target.is_dir():
+            raise ValueError("Unsafe subscription directory: " + str(target))
+        candidates[fmt] = {}
+        existing[fmt] = {}
+        for path in (stage / "public" / fmt).iterdir():
+            if not re.fullmatch(r"[0-9a-f]{32}", path.name) or path.is_symlink() or not path.is_file():
+                raise ValueError("Unexpected generated subscription: " + str(path))
+            data = path.read_bytes()
+            if not data.strip():
+                raise ValueError("Empty generated subscription: " + str(path))
+            if fmt == "default" and not base64.b64decode(data.strip(), validate=True):
+                raise ValueError("Empty default subscription")
+            if fmt in ("sing-box", "sing-box_profiles"):
+                value = json.loads(data)
+                if (fmt == "sing-box" and (not isinstance(value, dict) or not isinstance(value.get("outbounds"), list))) or (fmt == "sing-box_profiles" and not isinstance(value, list)):
+                    raise ValueError("Invalid sing-box subscription")
+            candidates[fmt][path.name] = path
+        # These directories own generated MD5 names; leave custom names untouched.
+        for path in target.iterdir():
+            if re.fullmatch(r"[0-9a-f]{32}", path.name):
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError("Unsafe generated subscription: " + str(path))
+                existing[fmt][path.name] = path
+    if not candidates["default"]:
+        raise ValueError("No account subscriptions generated")
+    for fmt in formats[1:]:
+        if not set(candidates[fmt]).issubset(candidates["default"]):
+            raise ValueError("Subscription formats contain different accounts")
+    if set(candidates["clashMeta"]) != set(candidates["clashMetaProfiles"]) or set(candidates["sing-box"]) != set(candidates["sing-box_profiles"]):
+        raise ValueError("Missing generated subscription format")
+    if salt.is_symlink() or (salt.exists() and not salt.is_file()):
+        raise ValueError("Unsafe subscription Salt file")
+    backup.mkdir(mode=0o700)
+    targets = [public / fmt / name for fmt in formats for name in set(existing[fmt]) | set(candidates[fmt])] + [salt]
+    for index, target in enumerate(targets):
+        copy = backup / str(index)
+        if target.exists():
+            shutil.copy2(target, copy)
+            sync_file(copy)
+            originals[target] = copy
+        else:
+            originals[target] = None
+    # The complete old state remains reconstructible even if this process is killed.
+    manifest = stage / "recovery.json"
+    manifest.write_text(json.dumps({"version": 1, "root": str(root), "entries": [
+        {"target": str(target.relative_to(root)),
+         "backup": str(copy.relative_to(stage)) if copy is not None else None}
+        for target, copy in originals.items()]}, indent=2) + "\n")
+    sync_file(manifest)
+    marker.write_text("Publication incomplete; inspect recovery.json before continuing.\n")
+    sync_file(marker)
+    for directory in (backup, stage, root):
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    for fmt in formats:
+        for name, candidate in candidates[fmt].items():
+            target = public / fmt / name
+            os.chmod(candidate, (target.stat().st_mode & 0o777) if target.exists() else 0o644)
+            changed.append(target)
+            os.replace(candidate, target)
+    for fmt in formats:
+        for name, target in existing[fmt].items():
+            if name not in candidates[fmt]:
+                changed.append(target)
+                target.unlink()
+    os.chmod(stage / "salt", 0o600)
+    changed.append(salt)
+    os.replace(stage / "salt", salt)
+    # All publication mutations are complete before the recovery marker is removed.
+    for signum in interrupts:
+        signal.signal(signum, signal.SIG_IGN)
+    marker.unlink()
+except BaseException as error:
+    # Avoid a second catchable signal interrupting ordinary compensation.
+    for signum in interrupts:
+        signal.signal(signum, signal.SIG_IGN)
+    rollback_errors = []
+    for target in reversed(changed):
+        try:
+            old = originals[target]
+            if old is None:
+                target.unlink(missing_ok=True)
+            else:
+                restoring = backup / ("restore-" + old.name)
+                shutil.copy2(old, restoring)
+                os.replace(restoring, target)
+        except Exception as rollback_error:
+            rollback_errors.append(str(rollback_error))
+    print("Subscription publication failed / 订阅发布失败: " + str(error), file=sys.stderr)
+    if rollback_errors:
+        marker.touch()
+        print("Recovery files retained at " + str(stage) + ": " + "; ".join(rollback_errors), file=sys.stderr)
+    else:
+        marker.unlink(missing_ok=True)
+    sys.exit(1)
+PY
+}
 subscribe() {
     readInstallProtocolType
     installSubscribe
@@ -9419,113 +9720,43 @@ subscribe() {
         if [[ -z "${subscribeSalt}" ]]; then
             subscribeSalt=$(initRandomSalt)
         fi
-        echoContent yellow "\n ---> Salt: ${subscribeSalt}"
-
-        echo "${subscribeSalt}" >/etc/v2ray-agent/subscribe_local/subscribeSalt
-
-        rm -rf /etc/v2ray-agent/subscribe/default/*
-        rm -rf /etc/v2ray-agent/subscribe/clashMeta/*
-        rm -rf /etc/v2ray-agent/subscribe_local/default/*
-        rm -rf /etc/v2ray-agent/subscribe_local/clashMeta/*
-        rm -rf /etc/v2ray-agent/subscribe_local/sing-box/*
-        showAccounts >/dev/null
-        if [[ -n $(ls /etc/v2ray-agent/subscribe_local/default/) ]]; then
-            if [[ -f "/etc/v2ray-agent/subscribe_remote/remoteSubscribeUrl" && -n $(cat "/etc/v2ray-agent/subscribe_remote/remoteSubscribeUrl") ]]; then
-                if [[ -z "${renewSalt}" ]]; then
-                    read -r -p "Other subscriptions found. Update them? [y/n]" updateOtherSubscribeStatus
-                else
-                    updateOtherSubscribeStatus=y
-                fi
+        command -v python3 >/dev/null || { echo "Install python3 first / 请先安装 python3。" >&2; return 1; }
+        local subscriptionRecovery
+        for subscriptionRecovery in /etc/v2ray-agent/.subscription-stage.*/KEEP_RECOVERY; do
+            if [[ -e "$subscriptionRecovery" ]]; then
+                echo "Unfinished subscription publication; inspect ${subscriptionRecovery%/*}/recovery.json before retrying / 上次订阅发布未完成，请先检查恢复清单。" >&2
+                return 1
             fi
-            local subscribePortLocal="${subscribePort}"
-            find /etc/v2ray-agent/subscribe_local/default/* | while read -r email; do
-                email=$(echo "${email}" | awk -F "[d][e][f][a][u][l][t][/]" '{print $2}')
-
-                # md5 encryption
-                local emailMd5=
-                emailMd5=$(echo -n "${email}${subscribeSalt}"$'\n' | md5sum | awk '{print $1}')
-
-                cat "/etc/v2ray-agent/subscribe_local/default/${email}" >>"/etc/v2ray-agent/subscribe/default/${emailMd5}"
-                if [[ "${updateOtherSubscribeStatus}" == "y" ]]; then
-                    updateRemoteSubscribe "${emailMd5}" "${email}"
-                fi
-                local base64Result
-                base64Result=$(base64 -w 0 "/etc/v2ray-agent/subscribe/default/${emailMd5}")
-                echo "${base64Result}" >"/etc/v2ray-agent/subscribe/default/${emailMd5}"
-                echoContent yellow "--------------------------------------------------------------"
-                local currentDomain=${currentHost}
-
-                if [[ -n "${currentDefaultPort}" && "${currentDefaultPort}" != "443" ]]; then
-                    currentDomain="${currentHost}:${currentDefaultPort}"
-                fi
-                if [[ -n "${subscribePortLocal}" ]]; then
-                    if [[ "${subscribeType}" == "http" ]]; then
-                        currentDomain="$(getPublicIP):${subscribePort}"
-                    else
-                        currentDomain="${currentHost}:${subscribePort}"
-                    fi
-                fi
-                if [[ -f "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" ]]; then
-                        cat "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" >>"/etc/v2ray-agent/subscribe/clashMeta/${emailMd5}"
-
-                        sed -i '1i\proxies:' "/etc/v2ray-agent/subscribe/clashMeta/${emailMd5}"
-
-                        local clashProxyUrl="${subscribeType}://${currentDomain}/s/clashMeta/${emailMd5}"
-                        clashMetaConfig "${clashProxyUrl}" "${emailMd5}"
-                fi
-                if [[ -f "/etc/v2ray-agent/subscribe_local/sing-box/${email}" ]]; then
-                        cp "/etc/v2ray-agent/subscribe_local/sing-box/${email}" "/etc/v2ray-agent/subscribe/sing-box_profiles/${emailMd5}"
-
-    echoContent skyBlue "\n====================== Add other machine subscriptions==================== ==="
-                        if [[ "${release}" == "alpine" ]]; then
-                            wget -O "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" -q "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/documents/sing-box.json"
-                        else
-                            wget -O "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" -q "${wgetShowProgressStatus}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/documents/sing-box.json"
-                        fi
-
-                        jq ".outbounds=$(jq ".outbounds|map(if has(\"outbounds\") then .outbounds += $(jq ".|map(.tag)" "/etc/v2ray-agent/subscribe_local/sing-box/${email}") else . end)" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}")" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" >"/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" && mv "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}"
-                        jq ".outbounds += $(jq '.' "/etc/v2ray-agent/subscribe_local/sing-box/${email}")" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" >"/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" && mv "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}"
-                fi
-                if [[ -z "${showStatus}" ]]; then
-    echoContent skyBlue "\nFunction 1/1: reality uninstall"
-                    echoContent green "email:${email}\n"
-                    echoContent yellow "url:${subscribeType}://${currentDomain}/s/default/${emailMd5}\n"
-    echoContent yellow "2.Remove"
-                    if [[ "${release}" != "alpine" ]]; then
-                        echo "${subscribeType}://${currentDomain}/s/default/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
-                    fi
-
-                    # clashMeta
-                #clashMeta
-                    if [[ -f "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" ]]; then
-
-    echoContent skyBlue "\nFunction 1/${totalProgress}: Account Management"
-                        echoContent yellow "url:${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}\n"
-    echoContent yellow "#Notes:"
-                        if [[ "${release}" != "alpine" ]]; then
-                            echo "${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
-                        fi
-
-                    fi
-                    # sing-box
-                    if [[ -f "/etc/v2ray-agent/subscribe_local/sing-box/${email}" ]]; then
-
-    echoContent skyBlue "Input example: www.v2ray-agent.com:443:vps1\n"
-                        echoContent yellow "url:${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}\n"
-    echoContent yellow "Please read the following article carefully: https://www.v2ray-agent.com/archives/1681804748677"
-                        if [[ "${release}" != "alpine" ]]; then
-                            echo "${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
-                        fi
-
-                    fi
-
-                    echoContent skyBlue "--------------------------------------------------------------"
-                else
-        echoContent green " ---> Domain whitelist added successfully"
-                fi
-
-            done
+        done
+        local updateOtherSubscribeStatus=
+        if [[ -s "/etc/v2ray-agent/subscribe_remote/remoteSubscribeUrl" ]]; then
+            if [[ -z "${renewSalt}" ]]; then
+                read -r -p "Update other subscriptions / 更新其他订阅？[y/n]:" updateOtherSubscribeStatus
+            else
+                updateOtherSubscribeStatus=y
+            fi
         fi
+        local subscriptionStage subscriptionOutputRoot subscriptionResult
+        subscriptionStage=$(mktemp -d /etc/v2ray-agent/.subscription-stage.XXXXXX) || return 1
+        subscriptionOutputRoot="${subscriptionStage}/public"
+        if ! mkdir -p "${subscriptionOutputRoot}"/{default,clashMeta,clashMetaProfiles,sing-box,sing-box_profiles} ||
+            ! printf '%s\n' "${subscribeSalt}" >"${subscriptionStage}/salt"; then
+            rm -rf -- "$subscriptionStage"
+            return 1
+        fi
+        if agentGenerateSubscriptions >"${subscriptionStage}/output" && agentPublishSubscriptions "$subscriptionStage"; then
+            cat "${subscriptionStage}/output"
+            echoContent yellow "\n ---> Salt: ${subscribeSalt}"
+            echoContent green "Subscriptions updated / 订阅已更新，请使用客户端重新拉取。"
+            subscriptionResult=0
+        else
+            echoContent red "Subscription update failed; check errors and recovery status / 订阅更新失败；请检查错误和恢复状态。"
+            subscriptionResult=1
+        fi
+        if [[ ! -f "${subscriptionStage}/KEEP_RECOVERY" ]]; then
+            rm -rf -- "$subscriptionStage"
+        fi
+        return "$subscriptionResult"
     else
         echoContent red "================================================== ==============="
     fi
@@ -9557,7 +9788,7 @@ updateRemoteSubscribe() {
         clashMetaProxies=$(curl -s "${subscribeType}://${remoteUrl}/s/clashMeta/${emailMD5}" | sed '/proxies:/d' | sed "s/\"${email}/\"${email}_${serverAlias}/g")
 
         if ! echo "${clashMetaProxies}" | grep -q "nginx" && [[ -n "${clashMetaProxies}" ]]; then
-            echo "${clashMetaProxies}" >>"/etc/v2ray-agent/subscribe/clashMeta/${emailMD5}"
+            echo "${clashMetaProxies}" >>"${subscriptionOutputRoot:-/etc/v2ray-agent/subscribe}/clashMeta/${emailMD5}"
         echoContent green " ---> Added successfully"
         else
         echoContent red " ---> Wrong selection"
@@ -9568,7 +9799,7 @@ updateRemoteSubscribe() {
 
         if ! echo "${default}" | grep -q "nginx" && [[ -n "${default}" ]]; then
             default=$(echo "${default}" | base64 -d | sed "s/#${email}/#${email}_${serverAlias}/g")
-            echo "${default}" >>"/etc/v2ray-agent/subscribe/default/${emailMD5}"
+            echo "${default}" >>"${subscriptionOutputRoot:-/etc/v2ray-agent/subscribe}/default/${emailMD5}"
 
             echoContent green " ---> WARP global outbound setting successful"
         else
@@ -10067,7 +10298,7 @@ singBoxVersionManageMenu() {
 # main menu
 menu() {
     cd "$HOME" || exit
-    echoContent green "Current version: v3.5.24-port.2"
+    echoContent green "Current version: v3.5.24-port.3"
     echoContent red "\n=============================================================="
         echoContent green " ---> WARP offload uninstall successful"
         echoContent green " ---> Added shunt successfully"

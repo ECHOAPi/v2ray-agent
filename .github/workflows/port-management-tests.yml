@@ -1,10 +1,10 @@
 name: Port management regression
 on:
   pull_request:
-    paths: ['install.sh', 'shell/install_en.sh', 'shell/port_manager/**', 'tests/**', '.github/workflows/port-management-tests.yml']
+    paths: ['install.sh', 'shell/install_en.sh', 'shell/init_tls.sh', 'shell/port_manager/**', 'tests/**', '.github/workflows/port-management-tests.yml']
   push:
     branches: ['master', 'codex/port-management-v1']
-    paths: ['install.sh', 'shell/install_en.sh', 'shell/port_manager/**', 'tests/**', '.github/workflows/port-management-tests.yml']
+    paths: ['install.sh', 'shell/install_en.sh', 'shell/init_tls.sh', 'shell/port_manager/**', 'tests/**', '.github/workflows/port-management-tests.yml']
 permissions:
   contents: read
 jobs:
@@ -15,7 +15,7 @@ jobs:
       - name: Install isolated test dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-yaml jq util-linux
       - name: Shell syntax
-        run: bash -n install.sh && bash -n shell/install_en.sh
+        run: bash -n install.sh && bash -n shell/install_en.sh && bash -n shell/init_tls.sh
       - name: Isolated regressions (no installer, kernel or service changes)
         # The extracted installer lock wrapper checks EUID. All filesystem
         # fixtures stay in temporary directories; service/kernel commands are fake.

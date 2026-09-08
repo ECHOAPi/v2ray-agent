@@ -17,8 +17,8 @@ BOB = "c6a5f475-81fa-4ae2-9aab-9d5e9e104002"
 def config(kind="xray", protocol="vless", suffix="VLESS_TCP/TLS_Vision", reverse=False, reality=False):
     users = []
     for name, credential in (("alice", ALICE), ("bob", BOB)):
-        key = "password" if protocol in ("trojan", "hysteria2", "anytls", "naive", "socks") else ("id" if kind == "xray" else "uuid")
-        label = "email" if kind == "xray" else ("username" if protocol in ("naive", "socks") else "name")
+        key = "password" if protocol in ("trojan", "hysteria2", "anytls", "naive", "socks", "http", "mixed") else ("id" if kind == "xray" else "uuid")
+        label = "email" if kind == "xray" else ("username" if protocol in ("naive", "socks", "http", "mixed") else "name")
         users.append({key: credential, label: name + "-" + suffix, "custom": {"preserve": name}})
         if protocol == "tuic":
             users[-1]["password"] = "independent-" + name
@@ -167,6 +167,77 @@ class AccountTests(unittest.TestCase):
             with self.subTest(rel=rel):
                 result, originals, _ = self.run_menu(rel, {
                     ("xray", "12_VLESS_XHTTP_inbounds"): config(suffix="VLESS_Reality_XHTTP"),
+                })
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assert_revoked(originals)
+
+    def test_last_auxiliary_user_rejects_before_any_publication(self):
+        for rel in INSTALLERS:
+            for core in ("1", "2"):
+                for protocol in ("socks", "http", "mixed"):
+                    with self.subTest(rel=rel, core=core, protocol=protocol):
+                        auxiliary = config("singbox", protocol, "auxiliary")
+                        inbound = auxiliary["inbounds"][0]
+                        inbound.update(listen="::", listen_port=19999)
+                        inbound["users"] = inbound["users"][:1]
+                        directory = "xray" if core == "1" else "singbox"
+                        result, originals, _ = self.run_menu(rel, {
+                            (directory, "02_VLESS_TCP_inbounds"): config(directory),
+                            ("singbox", "20_socks5_inbounds"): auxiliary,
+                        }, core=core, command_setup='''
+mv() { printf "ACCOUNT_FILE_PUBLISHED\\n"; command mv "$@"; }
+readNginxSubscribe() { printf "SUBSCRIPTION_UPDATED\\n"; }
+manageAccount() { printf "ACCOUNT_MENU_REENTERED\\n"; }
+''')
+                        self.assert_untouched(result, originals)
+                        for marker in ("ACCOUNT_FILE_PUBLISHED", "SUBSCRIPTION_UPDATED", "ACCOUNT_MENU_REENTERED"):
+                            self.assertNotIn(marker, result.stdout)
+                        self.assertIn("independent credentials", result.stderr)
+                        self.assertIn("请先为该入口改用独立凭证或禁用该入口", result.stderr)
+
+    def test_independent_auxiliary_user_is_preserved(self):
+        for rel in INSTALLERS:
+            with self.subTest(rel=rel):
+                auxiliary = config("singbox", "socks", "socks5")
+                auxiliary["inbounds"][0]["users"] = auxiliary["inbounds"][0]["users"][1:]
+                result, originals, _ = self.run_menu(rel, {
+                    ("xray", "02_VLESS_TCP_inbounds"): config(),
+                    ("singbox", "20_socks5_inbounds"): auxiliary,
+                })
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("RELOADED", result.stdout)
+                self.assert_revoked(originals)
+
+    def test_two_auxiliary_users_still_allow_revoking_one(self):
+        for rel in INSTALLERS:
+            with self.subTest(rel=rel):
+                result, originals, _ = self.run_menu(rel, {
+                    ("xray", "02_VLESS_TCP_inbounds"): config(),
+                    ("singbox", "20_socks5_inbounds"): config("singbox", "socks", "socks5", True),
+                })
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("RELOADED", result.stdout)
+                self.assert_revoked(originals)
+
+    def test_all_auxiliary_users_sharing_one_credential_reject(self):
+        for rel in INSTALLERS:
+            with self.subTest(rel=rel):
+                auxiliary = config("singbox", "socks", "socks5")
+                auxiliary["inbounds"][0]["users"][1]["password"] = ALICE
+                result, originals, _ = self.run_menu(rel, {
+                    ("xray", "02_VLESS_TCP_inbounds"): config(),
+                    ("singbox", "20_socks5_inbounds"): auxiliary,
+                })
+                self.assert_untouched(result, originals)
+
+    def test_already_empty_auxiliary_users_are_not_changed(self):
+        for rel in INSTALLERS:
+            with self.subTest(rel=rel):
+                auxiliary = config("singbox", "socks", "socks5")
+                auxiliary["inbounds"][0]["users"] = []
+                result, originals, _ = self.run_menu(rel, {
+                    ("xray", "02_VLESS_TCP_inbounds"): config(),
+                    ("singbox", "20_socks5_inbounds"): auxiliary,
                 })
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assert_revoked(originals)
