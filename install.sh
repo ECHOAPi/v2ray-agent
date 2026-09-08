@@ -1,4 +1,126 @@
 #!/usr/bin/env bash
+
+# Port management package is fetched at one immutable source revision.
+PORT_MANAGER_REVISION="PM_REVISION_PENDING"
+PORT_MANAGER_LANGUAGE="zh"
+PORT_MANAGER_SOURCE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+# The same lock is used by both installers, cron and the Python manager.
+agentWriteLock() {
+    if [[ ${EUID} -ne 0 ]]; then
+        echo "Run this installer as root." >&2
+        return 1
+    fi
+    command -v flock >/dev/null || { echo "flock (util-linux) is required." >&2; return 1; }
+    mkdir -p /etc/v2ray-agent || return 1
+    if [[ -L /etc/v2ray-agent/.write.lock || ( -e /etc/v2ray-agent/.write.lock && ! -f /etc/v2ray-agent/.write.lock ) ]]; then
+        echo "Writer lock must be a regular file, not a symlink." >&2
+        return 1
+    fi
+    if [[ ${agentLockOpen:-0} != 1 ]]; then
+        (umask 077; touch /etc/v2ray-agent/.write.lock) || return 1
+        exec 9<>/etc/v2ray-agent/.write.lock || return 1
+        agentLockOpen=1
+    fi
+    flock -x 9 || return 1
+    agentLockHeld=1
+}
+agentWriteUnlock() {
+    if [[ ${agentLockHeld:-0} == 1 ]]; then
+        flock -u 9 || return 1
+        agentLockHeld=0
+    fi
+}
+agentConfigDigest() {
+    # Policy counters intentionally do not invalidate a legacy input prompt.
+    # Account/config/subscription edits do: stale legacy actions must be retried.
+    find /etc/v2ray-agent/xray /etc/v2ray-agent/sing-box/conf \
+        /etc/v2ray-agent/subscribe /etc/v2ray-agent/subscribe_local \
+        /etc/v2ray-agent/nginx/conf.d /etc/nginx/conf.d \
+        -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum | sha256sum
+}
+read() {
+    local agentArg agentPrompt=0 agentBefore agentAfter agentReadResult
+    for agentArg in "$@"; do
+        [[ "$agentArg" == "-p" ]] && agentPrompt=1
+    done
+    if [[ ${agentLockHeld:-0} == 1 && ${agentPrompt} == 1 ]]; then
+        agentBefore=$(agentConfigDigest)
+        agentWriteUnlock || return 1
+        builtin read "$@"
+        agentReadResult=$?
+        agentWriteLock || exit 1
+        agentAfter=$(agentConfigDigest)
+        if [[ "$agentBefore" != "$agentAfter" ]]; then
+            echo "Configuration changed during input. Retry the operation / 配置已变更，请重新操作。" >&2
+            exit 1
+        fi
+        return "$agentReadResult"
+    fi
+    builtin read "$@"
+}
+portManagerInstallPackage() {
+    local revision=$1 destination staging name
+    [[ "$revision" =~ ^[a-f0-9]{40}$ ]] || { echo "Invalid port manager revision." >&2; return 1; }
+    command -v python3 >/dev/null || { echo "Install python3 and python3-yaml first." >&2; return 1; }
+    python3 -c 'import sys, sqlite3, yaml, zoneinfo; assert sys.version_info >= (3, 9)' || return 1
+    destination="/etc/v2ray-agent/port-manager-lib/${revision}"
+    if [[ ! -f "${destination}/.complete" ]]; then
+        install -d -m 700 /etc/v2ray-agent/port-manager-lib || return 1
+        staging=$(mktemp -d /etc/v2ray-agent/port-manager-lib/.candidate.XXXXXX) || return 1
+        install -d -m 700 "${staging}/port_manager" || return 1
+        for name in __init__.py __main__.py core.py subscriptions.py policies.py rate_limits.py; do
+            if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+                --connect-timeout 15 --max-time 120 \
+                "https://raw.githubusercontent.com/ECHOAPi/v2ray-agent/${revision}/shell/port_manager/${name}" \
+                -o "${staging}/port_manager/${name}"; then
+                rm -rf -- "$staging"
+                return 1
+            fi
+        done
+        chmod 600 "${staging}/port_manager/"*.py
+        if ! python3 -m compileall -q "${staging}/port_manager"; then
+            rm -rf -- "$staging"
+            return 1
+        fi
+        touch "${staging}/.complete"
+        mv -- "$staging" "$destination" || return 1
+    fi
+    # A versioned directory keeps an unsuccessful update from damaging old code.
+    local linkStage
+    linkStage=$(mktemp -d /etc/v2ray-agent/port-manager-lib/.link.XXXXXX) || return 1
+    ln -s "$revision" "${linkStage}/current" || return 1
+    mv -Tf "${linkStage}/current" /etc/v2ray-agent/port-manager-lib/current || return 1
+    rmdir "$linkStage"
+}
+portManager() {
+    local packagePath="/etc/v2ray-agent/port-manager-lib/${PORT_MANAGER_REVISION}"
+    if [[ "$PORT_MANAGER_REVISION" =~ ^[a-f0-9]{40}$ ]]; then
+        portManagerInstallPackage "$PORT_MANAGER_REVISION" || return 1
+    elif [[ -f "${PORT_MANAGER_SOURCE_DIR}/shell/port_manager/__main__.py" ]]; then
+        packagePath="${PORT_MANAGER_SOURCE_DIR}/shell"
+    elif [[ -f "${PORT_MANAGER_SOURCE_DIR}/port_manager/__main__.py" ]]; then
+        packagePath="${PORT_MANAGER_SOURCE_DIR}"
+    else
+        portManagerInstallPackage "$PORT_MANAGER_REVISION" || return 1
+    fi
+    agentWriteUnlock || return 1
+    PYTHONPATH="$packagePath" python3 -m port_manager --language "$PORT_MANAGER_LANGUAGE" "$@" 9>&-
+    local result=$?
+    agentWriteLock || return 1
+    return "$result"
+}
+agentRecoverBeforeLegacy() {
+    if [[ -d /etc/v2ray-agent/port-manager/transactions || \
+          -f /etc/v2ray-agent/port-manager/policies.sqlite3 || \
+          -f /etc/v2ray-agent/port-manager/rates.json ]]; then
+        portManager --reconcile >/dev/null || {
+            echo "Pending recovery blocks installer writes. / 请先处理端口管理恢复状态。" >&2
+            return 1
+        }
+    fi
+}
+
 # 检测区
 # -------------------------------------------------------------
 # 检查系统
@@ -1038,6 +1160,8 @@ cleanUp() {
         rm -rf /etc/v2ray-agent/sing-box/conf/config/* >/dev/null 2>&1
     fi
 }
+agentWriteLock || exit 1
+agentRecoverBeforeLegacy || exit 1
 initVar "$1"
 checkSystem
 checkCPUVendor
@@ -2730,14 +2854,14 @@ handleHysteria() {
 handleSingBox() {
     if [[ -f "/etc/systemd/system/sing-box.service" ]]; then
         if [[ -z $(pgrep -f "sing-box") ]] && [[ "$1" == "start" ]]; then
-            singBoxMergeConfig
+            singBoxMergeConfig || return 1
             systemctl start sing-box.service
         elif [[ -n $(pgrep -f "sing-box") ]] && [[ "$1" == "stop" ]]; then
             systemctl stop sing-box.service
         fi
     elif [[ -f "/etc/init.d/sing-box" ]]; then
         if [[ -z $(pgrep -f "sing-box") ]] && [[ "$1" == "start" ]]; then
-            singBoxMergeConfig
+            singBoxMergeConfig || return 1
             rc-service sing-box start
         elif [[ -n $(pgrep -f "sing-box") ]] && [[ "$1" == "stop" ]]; then
             rc-service sing-box stop
@@ -3795,9 +3919,19 @@ EOF
 
 # 合并config
 singBoxMergeConfig() {
-    initSingBoxHTTPClientConfig
-    rm /etc/v2ray-agent/sing-box/conf/config.json >/dev/null 2>&1
-    /etc/v2ray-agent/sing-box/sing-box merge config.json -C /etc/v2ray-agent/sing-box/conf/config/ -D /etc/v2ray-agent/sing-box/conf/ >/dev/null 2>&1
+    initSingBoxHTTPClientConfig || return 1
+    local candidate
+    candidate=$(mktemp /etc/v2ray-agent/sing-box/conf/.merged.XXXXXX) || return 1
+    if ! /etc/v2ray-agent/sing-box/sing-box merge "$candidate" \
+        -C /etc/v2ray-agent/sing-box/conf/config/ -D /etc/v2ray-agent/sing-box/conf/ \
+        >/dev/null 2>&1 || \
+        ! /etc/v2ray-agent/sing-box/sing-box check -c "$candidate" >/dev/null 2>&1; then
+        rm -f -- "$candidate"
+        echoContent red "sing-box merge/check failed; previous config retained. / 合并校验失败，已保留旧配置。"
+        return 1
+    fi
+    chmod 600 "$candidate" || { rm -f -- "$candidate"; return 1; }
+    mv -f -- "$candidate" /etc/v2ray-agent/sing-box/conf/config.json
 }
 
 # 初始化Xray Trojan XTLS 配置文件
@@ -5753,133 +5887,14 @@ updateNginxBlog() {
 
 # 添加新端口
 addCorePort() {
-
-    if [[ "${coreInstallType}" == "2" ]]; then
-        echoContent red "\n ---> 此功能仅支持Xray-core内核"
-        exit 0
-    fi
-
-    echoContent skyBlue "\n功能 1/${totalProgress} : 添加新端口"
-    echoContent red "\n=============================================================="
-    echoContent yellow "# 注意事项\n"
-    echoContent yellow "支持批量添加"
-    echoContent yellow "不影响默认端口的使用"
-    echoContent yellow "查看账号时，只会展示默认端口的账号"
-    echoContent yellow "不允许有特殊字符，注意逗号的格式"
-    echoContent yellow "如已安装hysteria，会同时安装hysteria新端口"
-    echoContent yellow "录入示例:2053,2083,2087\n"
-
-    echoContent yellow "1.查看已添加端口"
-    echoContent yellow "2.添加端口"
-    echoContent yellow "3.删除端口"
-    echoContent red "=============================================================="
-    read -r -p "请选择:" selectNewPortType
-    if [[ "${selectNewPortType}" == "1" ]]; then
-        find ${configPath} -name "*dokodemodoor*" | grep -v "hysteria" | awk -F "[c][o][n][f][/]" '{print $2}' | awk -F "[_]" '{print $4}' | awk -F "[.]" '{print ""NR""":"$1}'
-        exit 0
-    elif [[ "${selectNewPortType}" == "2" ]]; then
-        read -r -p "请输入端口号:" newPort
-        read -r -p "请输入默认的端口号，同时会更改订阅端口以及节点端口，[回车]默认443:" defaultPort
-
-        if [[ -n "${defaultPort}" ]]; then
-            rm -rf "$(find ${configPath}* | grep "default")"
-        fi
-
-        if [[ -n "${newPort}" ]]; then
-
-            while read -r port; do
-                rm -rf "$(find ${configPath}* | grep "${port}")"
-
-                local fileName=
-                local hysteriaFileName=
-                if [[ -n "${defaultPort}" && "${port}" == "${defaultPort}" ]]; then
-                    fileName="${configPath}02_dokodemodoor_inbounds_${port}_default.json"
-                else
-                    fileName="${configPath}02_dokodemodoor_inbounds_${port}.json"
-                fi
-
-                if [[ -n ${hysteriaPort} ]]; then
-                    hysteriaFileName="${configPath}02_dokodemodoor_inbounds_hysteria_${port}.json"
-                fi
-
-                # 开放端口
-                allowPort "${port}"
-                allowPort "${port}" "udp"
-
-                local settingsPort=443
-                if [[ -n "${customPort}" ]]; then
-                    settingsPort=${customPort}
-                fi
-
-                if [[ -n ${hysteriaFileName} ]]; then
-                    cat <<EOF >"${hysteriaFileName}"
-{
-  "inbounds": [
-	{
-	  "listen": "0.0.0.0",
-	  "port": ${port},
-	  "protocol": "dokodemo-door",
-	  "settings": {
-		"address": "127.0.0.1",
-		"port": ${hysteriaPort},
-		"network": "udp",
-		"followRedirect": false
-	  },
-	  "tag": "dokodemo-door-newPort-hysteria-${port}"
-	}
-  ]
+    portManager
 }
-EOF
-                fi
-                cat <<EOF >"${fileName}"
-{
-  "inbounds": [
-	{
-	  "listen": "0.0.0.0",
-	  "port": ${port},
-	  "protocol": "dokodemo-door",
-	  "settings": {
-		"address": "127.0.0.1",
-		"port": ${settingsPort},
-		"network": "tcp",
-		"followRedirect": false
-	  },
-	  "tag": "dokodemo-door-newPort-${port}"
-	}
-  ]
-}
-EOF
-            done < <(echo "${newPort}" | tr ',' '\n')
-
-            echoContent green " ---> 添加完毕"
-            reloadCore
-            addCorePort
-        fi
-    elif [[ "${selectNewPortType}" == "3" ]]; then
-        find ${configPath} -name "*dokodemodoor*" | grep -v "hysteria" | awk -F "[c][o][n][f][/]" '{print $2}' | awk -F "[_]" '{print $4}' | awk -F "[.]" '{print ""NR""":"$1}'
-        read -r -p "请输入要删除的端口编号:" portIndex
-        local dokoConfig
-        dokoConfig=$(find ${configPath} -name "*dokodemodoor*" | grep -v "hysteria" | awk -F "[c][o][n][f][/]" '{print $2}' | awk -F "[_]" '{print $4}' | awk -F "[.]" '{print ""NR""":"$1}' | grep "${portIndex}:")
-        if [[ -n "${dokoConfig}" ]]; then
-            rm "${configPath}02_dokodemodoor_inbounds_$(echo "${dokoConfig}" | awk -F "[:]" '{print $2}').json"
-            local hysteriaDokodemodoorFilePath=
-
-            hysteriaDokodemodoorFilePath="${configPath}02_dokodemodoor_inbounds_hysteria_$(echo "${dokoConfig}" | awk -F "[:]" '{print $2}').json"
-            if [[ -f "${hysteriaDokodemodoorFilePath}" ]]; then
-                rm "${hysteriaDokodemodoorFilePath}"
-            fi
-
-            reloadCore
-            addCorePort
-        else
-            echoContent yellow "\n ---> 编号输入错误，请重新选择"
-            addCorePort
-        fi
-    fi
-}
-
 # 卸载脚本
 unInstall() {
+    if [[ -f /etc/v2ray-agent/port-manager/policies.sqlite3 || -f /etc/v2ray-agent/port-manager/rates.json ]]; then
+        echoContent red "Managed policy state exists. Follow the port-management decommission guide before uninstalling. / 请先按端口管理说明解除后台策略。"
+        return 1
+    fi
     read -r -p "是否确认卸载安装内容？[y/n]:" unInstallStatus
     if [[ "${unInstallStatus}" != "y" ]]; then
         echoContent green " ---> 放弃卸载"
@@ -6350,24 +6365,29 @@ removeUser() {
 }
 # 更新脚本
 updateV2RayAgent() {
-    echoContent skyBlue "\n进度  $1/${totalProgress} : 更新v2ray-agent脚本"
-    rm -rf /etc/v2ray-agent/install.sh
-    if [[ "${release}" == "alpine" ]]; then
-        wget -c -q -P /etc/v2ray-agent/ -N --no-check-certificate "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh"
-    else
-        wget -c -q "${wgetShowProgressStatus}" -P /etc/v2ray-agent/ -N --no-check-certificate "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh"
+    local candidate revision scriptPath="install.sh"
+    echoContent skyBlue "Updating ECHOAPi/v2ray-agent / 更新脚本"
+    candidate=$(mktemp /etc/v2ray-agent/.install.XXXXXX) || return 1
+    if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --connect-timeout 15 --max-time 120 \
+        "https://raw.githubusercontent.com/ECHOAPi/v2ray-agent/master/${scriptPath}" -o "$candidate" \
+        || ! bash -n "$candidate"; then
+        rm -f -- "$candidate"
+        echoContent red "Update failed; previous script retained. / 更新失败，已保留旧脚本。"
+        return 1
     fi
-
-    sudo chmod 700 /etc/v2ray-agent/install.sh
-    local version
-    version=$(grep '当前版本：v' "/etc/v2ray-agent/install.sh" | awk -F "[v]" '{print $2}' | tail -n +2 | head -n 1 | awk -F "[\"]" '{print $1}')
-
-    echoContent green "\n ---> 更新完毕"
-    echoContent yellow " ---> 请手动执行[vasma]打开脚本"
-    echoContent green " ---> 当前版本：${version}\n"
-    echoContent yellow "如更新不成功，请手动执行下面命令\n"
-    echoContent skyBlue "wget -P /root -N --no-check-certificate https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh && chmod 700 /root/install.sh && /root/install.sh"
-    echo
+    revision=$(sed -n 's/^PORT_MANAGER_REVISION="\([a-f0-9]\{40\}\)"$/\1/p' "$candidate")
+    if ! portManagerInstallPackage "$revision"; then
+        rm -f -- "$candidate"
+        return 1
+    fi
+    chmod 700 "$candidate" || return 1
+    if [[ -f /etc/v2ray-agent/install.sh ]]; then
+        cp -p /etc/v2ray-agent/install.sh /etc/v2ray-agent/install.sh.previous || return 1
+    fi
+    mv -f -- "$candidate" /etc/v2ray-agent/install.sh || return 1
+    systemctl try-restart --no-block v2ray-agent-port-policy.service >/dev/null 2>&1 || true
+    echoContent green "Update complete. Run vasma again. / 更新完成，请重新运行 vasma。"
     exit 0
 }
 
@@ -9471,6 +9491,27 @@ subscribe() {
                         currentDomain="${currentHost}:${subscribePort}"
                     fi
                 fi
+                if [[ -f "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" ]]; then
+                        cat "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" >>"/etc/v2ray-agent/subscribe/clashMeta/${emailMd5}"
+
+                        sed -i '1i\proxies:' "/etc/v2ray-agent/subscribe/clashMeta/${emailMd5}"
+
+                        local clashProxyUrl="${subscribeType}://${currentDomain}/s/clashMeta/${emailMd5}"
+                        clashMetaConfig "${clashProxyUrl}" "${emailMd5}"
+                fi
+                if [[ -f "/etc/v2ray-agent/subscribe_local/sing-box/${email}" ]]; then
+                        cp "/etc/v2ray-agent/subscribe_local/sing-box/${email}" "/etc/v2ray-agent/subscribe/sing-box_profiles/${emailMd5}"
+
+                        echoContent skyBlue " ---> 下载 sing-box 通用配置文件"
+                        if [[ "${release}" == "alpine" ]]; then
+                            wget -O "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" -q "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/documents/sing-box.json"
+                        else
+                            wget -O "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" -q "${wgetShowProgressStatus}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/documents/sing-box.json"
+                        fi
+
+                        jq ".outbounds=$(jq ".outbounds|map(if has(\"outbounds\") then .outbounds += $(jq ".|map(.tag)" "/etc/v2ray-agent/subscribe_local/sing-box/${email}") else . end)" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}")" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" >"/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" && mv "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}"
+                        jq ".outbounds += $(jq '.' "/etc/v2ray-agent/subscribe_local/sing-box/${email}")" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" >"/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" && mv "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}"
+                fi
                 if [[ -z "${showStatus}" ]]; then
                     echoContent skyBlue "\n----------默认订阅----------\n"
                     echoContent green "email:${email}\n"
@@ -9483,12 +9524,6 @@ subscribe() {
                     # clashMeta
                     if [[ -f "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" ]]; then
 
-                        cat "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" >>"/etc/v2ray-agent/subscribe/clashMeta/${emailMd5}"
-
-                        sed -i '1i\proxies:' "/etc/v2ray-agent/subscribe/clashMeta/${emailMd5}"
-
-                        local clashProxyUrl="${subscribeType}://${currentDomain}/s/clashMeta/${emailMd5}"
-                        clashMetaConfig "${clashProxyUrl}" "${emailMd5}"
                         echoContent skyBlue "\n----------clashMeta订阅----------\n"
                         echoContent yellow "url:${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}\n"
                         echoContent yellow "在线二维码:https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}\n"
@@ -9499,17 +9534,6 @@ subscribe() {
                     fi
                     # sing-box
                     if [[ -f "/etc/v2ray-agent/subscribe_local/sing-box/${email}" ]]; then
-                        cp "/etc/v2ray-agent/subscribe_local/sing-box/${email}" "/etc/v2ray-agent/subscribe/sing-box_profiles/${emailMd5}"
-
-                        echoContent skyBlue " ---> 下载 sing-box 通用配置文件"
-                        if [[ "${release}" == "alpine" ]]; then
-                            wget -O "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" -q "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/documents/sing-box.json"
-                        else
-                            wget -O "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" -q "${wgetShowProgressStatus}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/documents/sing-box.json"
-                        fi
-
-                        jq ".outbounds=$(jq ".outbounds|map(if has(\"outbounds\") then .outbounds += $(jq ".|map(.tag)" "/etc/v2ray-agent/subscribe_local/sing-box/${email}") else . end)" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}")" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" >"/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" && mv "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}"
-                        jq ".outbounds += $(jq '.' "/etc/v2ray-agent/subscribe_local/sing-box/${email}")" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" >"/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" && mv "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}"
 
                         echoContent skyBlue "\n----------sing-box订阅----------\n"
                         echoContent yellow "url:${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}\n"
@@ -10076,8 +10100,8 @@ menu() {
     cd "$HOME" || exit
     echoContent red "\n=============================================================="
     echoContent green "作者：mack-a"
-    echoContent green "当前版本：v3.5.23"
-    echoContent green "Github：https://github.com/mack-a/v2ray-agent"
+    echoContent green "当前版本：v3.5.24-port.1"
+    echoContent green "Github：https://github.com/ECHOAPi/v2ray-agent"
     echoContent green "描述：八合一共存脚本\c"
     showInstallStatus
     checkWgetShowProgress
@@ -10110,7 +10134,7 @@ menu() {
     echoContent yellow "9.证书管理"
     echoContent yellow "10.CDN节点管理"
     echoContent yellow "11.分流工具"
-    echoContent yellow "12.添加新端口"
+    echoContent yellow "12.端口管理"
     echoContent yellow "13.BT下载管理"
     echoContent yellow "15.域名黑名单"
     echoContent skyBlue "-------------------------版本管理-----------------------------"
@@ -10158,7 +10182,7 @@ menu() {
         routingToolsMenu 1
         ;;
     12)
-        addCorePort 1
+        portManager
         ;;
     13)
         btTools 1

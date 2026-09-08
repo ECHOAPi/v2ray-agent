@@ -1,5 +1,7 @@
 # v2ray-agent
 
+本分支包含端口管理实施草稿：[使用说明与支持边界](documents/port-management.md)、[验证记录](documents/port-management-validation.md)。真实核心和流量验收尚未完成，限速对 IP 分片仍有已知覆盖缺口。
+
 - [感谢 JetBrains 提供的非商业开源软件开发授权](https://www.jetbrains.com/?from=v2ray-agent)
 
 
@@ -28,7 +30,7 @@ Xray-core/sing-box 一键脚本快速安装
 ### 安装脚本版
 
 ```
-wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh" && chmod 700 /root/install.sh && /root/install.sh
+curl --fail --location --proto '=https' --tlsv1.2 "https://raw.githubusercontent.com/ECHOAPi/v2ray-agent/master/install.sh" -o /root/install.sh && bash -n /root/install.sh && chmod 700 /root/install.sh && /root/install.sh
 ```
 
 ### 使用

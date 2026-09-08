@@ -1,0 +1,27 @@
+[Unit]
+Description=v2ray-agent persistent port quota and rate policy
+After=local-fs.target network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+Before=xray.service sing-box.service
+AssertPathIsDirectory=/etc/v2ray-agent/port-manager-lib/current/port_manager
+
+[Service]
+Type=exec
+Environment=PYTHONPATH=/etc/v2ray-agent/port-manager-lib/current
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/usr/bin/python3 -m port_manager --root /etc/v2ray-agent --startup-reconcile
+ExecStart=/usr/bin/python3 -m port_manager --root /etc/v2ray-agent --daemon
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=120
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/v2ray-agent
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

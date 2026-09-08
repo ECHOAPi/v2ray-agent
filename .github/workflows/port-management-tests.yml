@@ -1,0 +1,20 @@
+name: Port management regression
+on:
+  pull_request:
+    paths: ['install.sh', 'shell/install_en.sh', 'shell/port_manager/**', 'tests/**', '.github/workflows/port-management-tests.yml']
+  push:
+    branches: ['master', 'codex/port-management-v1']
+    paths: ['install.sh', 'shell/install_en.sh', 'shell/port_manager/**', 'tests/**', '.github/workflows/port-management-tests.yml']
+permissions:
+  contents: read
+jobs:
+  isolated-regression:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install parser dependency
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
+      - name: Shell syntax
+        run: bash -n install.sh && bash -n shell/install_en.sh
+      - name: Isolated regressions (no installer, kernel or service changes)
+        run: PYTHONPATH=shell /usr/bin/python3 -m unittest discover -s tests -p 'test_port*.py' -v
