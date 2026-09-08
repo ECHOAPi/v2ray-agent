@@ -267,31 +267,71 @@ class Services:
                 self.unit_root / "xray.service.d" / "50-v2ray-agent-port-manager.conf": dropin,
                 self.unit_root / "sing-box.service.d" / "50-v2ray-agent-port-manager.conf": dropin}
 
+    @contextmanager
+    def _installation_lock(self):
+        # Keep competing installers serialized while ExecStartPre/the daemon
+        # acquire the separate common writer lock during start and stop.
+        self.root.mkdir(parents=True, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(self.root / ".port-policy-install.lock", flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ValueError("服务安装锁必须是普通文件 / Service installation lock must be a regular file")
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise ValueError("后台服务正在安装，请稍后重试 / Background service installation is in progress; retry later")
+                    time.sleep(0.1)
+            yield
+        finally:
+            os.close(fd)
+
     def ensure(self, manager):
-        if self.ready():
-            return {"status": "active"}
+        with self._installation_lock():
+            if self.ready():
+                return {"status": "active"}
+            if os.environ.get("PORT_MANAGER_LOCK_FD") is not None:
+                raise ValueError("请释放调用者写锁后安装服务 / Release the caller's writer lock before installing the service")
+            return self._install(manager)
+
+    def _install(self, manager):
         module = self.root / "port-manager-lib" / "current" / "port_manager" / "__main__.py"
         if not module.is_file():
             raise ValueError("请先通过主脚本安装端口管理模块 / Install the port manager using the main installer first")
         templates = self.templates()
         created = []
-        with shared_lock(self.root):
-            manager.recover()
-            existing = self._run(["systemctl", "show", "--property=FragmentPath", "--value", self.unit], False)
-            fragment = existing.stdout.strip()
-            if existing.returncode == 0 and fragment and fragment != str(self.unit_root / self.unit):
-                raise ValueError("已有同名服务来源未知 / Existing service with this name has unknown ownership")
-            # Refuse to replace customized service definitions.
-            for path, content in templates.items():
-                if path.is_symlink() or any(parent.is_symlink() for parent in path.parents if parent != Path("/")):
-                    raise ValueError("拒绝替换符号链接服务文件 / Refusing symlinked service files")
-                if path.exists() and path.read_text() != content:
-                    raise ValueError("已有后台服务配置需要人工核对 / Existing background service configuration needs review")
-            try:
+        created_directories = []
+        enable_attempted = False
+        start_attempted = False
+        was_active = False
+        try:
+            with shared_lock(self.root):
+                manager.recover()
+                existing = self._run(["systemctl", "show", "--property=FragmentPath", "--value", self.unit], False)
+                fragment = existing.stdout.strip()
+                if existing.returncode == 0 and fragment and fragment != str(self.unit_root / self.unit):
+                    raise ValueError("已有同名服务来源未知 / Existing service with this name has unknown ownership")
+                # Refuse to replace customized service definitions.
+                for path, content in templates.items():
+                    if path.is_symlink() or any(parent.is_symlink() for parent in path.parents if parent != Path("/")):
+                        raise ValueError("拒绝替换符号链接服务文件 / Refusing symlinked service files")
+                    if path.exists() and (not path.is_file() or path.read_text() != content):
+                        raise ValueError("已有后台服务配置需要人工核对 / Existing background service configuration needs review")
+                enabled = self._run(["systemctl", "is-enabled", self.unit], False)
+                if enabled.stdout.strip() in {"masked", "masked-runtime"}:
+                    raise ValueError("后台服务已屏蔽，请先核对 systemd 设置 / Background service is masked; review systemd settings first")
+                was_enabled = enabled.returncode == 0
+                was_active = self._run(["systemctl", "is-active", "--quiet", self.unit], False).returncode == 0
                 for path, content in templates.items():
                     if path.exists():
                         continue
-                    path.parent.mkdir(parents=True, exist_ok=True)
+                    if not path.parent.exists():
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        created_directories.append(path.parent)
                     fd, temporary = tempfile.mkstemp(prefix=".port-manager-", dir=path.parent)
                     try:
                         with os.fdopen(fd, "w") as handle:
@@ -305,19 +345,56 @@ class Services:
                             os.unlink(temporary)
                     created.append(path)
                 self._run(["systemctl", "daemon-reload"])
-                self._run(["systemctl", "enable", self.unit])
-            except Exception:
-                if self.unit_root / self.unit in created:
-                    self._run(["systemctl", "disable", self.unit], False)
-                for path in reversed(created):
-                    if path.exists() and path.read_text() == templates[path]:
-                        path.unlink()
-                self._run(["systemctl", "daemon-reload"], False)
-                raise
-        # ExecStartPre takes the same lock. Starting outside our lock is essential.
-        self._run(["systemctl", "start", self.unit])
-        if not self.ready():
-            raise ValueError("后台服务未就绪；策略未提交 / Background service is not ready; policies were not submitted")
+                if not was_enabled:
+                    # enable can fail after adding some links, so compensate
+                    # even when the command itself returns an error.
+                    enable_attempted = True
+                    self._run(["systemctl", "enable", self.unit])
+            # ExecStartPre and daemon shutdown both take the common lock.
+            start_attempted = True
+            self._run(["systemctl", "start", self.unit])
+            if not self.ready():
+                raise ValueError("后台服务未就绪；策略未提交 / Background service is not ready; policies were not submitted")
+        except BaseException as original:
+            cleanup_errors = []
+
+            def cleanup_command(argv):
+                try:
+                    if self._run(argv, False).returncode:
+                        cleanup_errors.append(" ".join(argv))
+                except Exception:
+                    cleanup_errors.append(" ".join(argv))
+
+            if start_attempted and not was_active:
+                # Cancel this unit's automatic restart without propagating a
+                # stop through newly installed or preexisting Requires edges.
+                cleanup_command(["systemctl", "stop", "--job-mode=ignore-dependencies", self.unit])
+            if created or created_directories or enable_attempted:
+                try:
+                    with shared_lock(self.root):
+                        if enable_attempted:
+                            cleanup_command(["systemctl", "disable", self.unit])
+                        for path in reversed(created):
+                            try:
+                                if (path.is_symlink() or any(parent.is_symlink() for parent in path.parents if parent != Path("/"))
+                                        or path.exists() and (not path.is_file() or path.read_text() != templates[path])):
+                                    cleanup_errors.append(str(path))
+                                elif path.exists():
+                                    path.unlink()
+                            except OSError:
+                                cleanup_errors.append(str(path))
+                        for directory in reversed(created_directories):
+                            try:
+                                directory.rmdir()
+                            except OSError:
+                                # Other operator-owned files may now be present.
+                                pass
+                        cleanup_command(["systemctl", "daemon-reload"])
+                except Exception:
+                    cleanup_errors.append("writer lock")
+            if cleanup_errors:
+                raise ValueError("服务安装失败且补偿未完成，请核对 / Service installation failed and rollback is incomplete; inspect: " + ", ".join(cleanup_errors)) from original
+            raise
         return {"status": "active"}
 
 
