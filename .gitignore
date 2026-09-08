@@ -9,3 +9,6 @@ AGENTS.md
 .worktrees/
 docs
 .sisyphus
+__pycache__/
+*.py[cod]
+.pytest_cache/
