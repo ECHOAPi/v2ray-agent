@@ -19,7 +19,7 @@ from port_manager.policies import PolicyManager
 REPO = Path(__file__).resolve().parents[1]
 INSTALLERS = ("install.sh", "shell/install_en.sh")
 HELPERS = ("agentWriteLock", "agentWriteUnlock", "agentConfigDigest", "agentPreparationDigest",
-           "agentPrepare", "agentGeoDigest", "agentGeoRecoveryClear", "agentDownloadGeo",
+           "agentPrepare", "agentManagedRecoveryClear", "agentGeoDigest", "agentGeoRecoveryClear", "agentDownloadGeo",
            "agentPublishGeo", "updateGeoSite")
 
 

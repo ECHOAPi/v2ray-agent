@@ -52,7 +52,7 @@ class ReleaseTests(unittest.TestCase):
     def test_complete_versions_are_parsed_from_both_installers(self):
         for name in ("install.sh", "shell/install_en.sh"):
             result = self.run_js(parse=(REPO / name).read_text())
-            self.assertEqual(result["version"], "v3.5.24-port.4")
+            self.assertEqual(result["version"], "v3.5.24-port.5")
         for version in ("v3.5.24", "v3.5.24-port.4", "v3.5.24-rc.1"):
             result = self.run_js(parse=f'echoContent green "当前版本：{version}"')
             self.assertEqual(result["version"], version)
