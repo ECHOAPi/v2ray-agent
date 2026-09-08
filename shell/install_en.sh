@@ -1315,15 +1315,22 @@ checkRoot() {
     fi
 }
 # Install toolkit
+agentPackageManagerReady() {
+    local status
+    command -v pgrep >/dev/null || return 1
+    # Exact process names only; never kill package managers or delete their locks.
+    pgrep -x 'apt|apt-get|dpkg|unattended-upgr|yum|dnf' >/dev/null
+    status=$?
+    [[ "$status" == 1 ]] && return 0
+    echo "Package manager busy or process check failed; retry later. / 包管理器忙或检查失败，请稍后重试。" >&2
+    return 1
+}
 installTools() {
+    agentPackageManagerReady || exit 1
                 echoContent skyBlue "sed -i \"1i\\\nameserver 2001:67c:2b0::4\\\nnameserver 2a00:1098:2c::1\" /etc/resolv.conf"
     # Repair individual system problems in ubuntu
     if [[ "${release}" == "ubuntu" ]]; then
-        dpkg --configure -a
-    fi
-
-    if [[ -n $(pgrep -f "apt") ]]; then
-        pgrep -f apt | xargs kill -9
+        dpkg --configure -a || exit 1
     fi
 
         echoContent green " ---> install unzip"
@@ -1337,7 +1344,6 @@ installTools() {
     fi
 
     if [[ "${release}" == "centos" ]]; then
-        rm -rf /var/run/yum.pid
         ${installType} epel-release >/dev/null 2>&1
     fi
 
@@ -2437,17 +2443,40 @@ handleNginx() {
 }
 
 # Scheduled task to update tls certificate
-installCronTLS() {
-    if [[ -z "${btDomain}" ]]; then
-        echoContent skyBlue "\nProgress$1/${totalProgress}: Add scheduled maintenance certificate"
-        crontab -l >/etc/v2ray-agent/backup_crontab.cron
-        local historyCrontab
-        historyCrontab=$(sed '/v2ray-agent/d;/acme.sh/d' /etc/v2ray-agent/backup_crontab.cron)
-        echo "${historyCrontab}" >/etc/v2ray-agent/backup_crontab.cron
-        echo "30 1 * * * /bin/bash /etc/v2ray-agent/install.sh RenewTLS >> /etc/v2ray-agent/crontab_tls.log 2>&1" >>/etc/v2ray-agent/backup_crontab.cron
-        crontab /etc/v2ray-agent/backup_crontab.cron
-        echoContent green "\n ---> Adding scheduled update geo file successfully"
+agentReadCrontab() {
+    local destination=$1 errors=$2 status
+    LC_ALL=C crontab -l >"$destination" 2>"$errors"
+    status=$?
+    [[ "$status" == 0 ]] && return 0
+    # A failed read is not an empty crontab. Only accept the explicit absent case.
+    if [[ "$status" == 1 && ! -s "$destination" ]] &&
+        [[ "$(<"$errors")" == "no crontab for $(id -un)" ]]; then
+        return 0
     fi
+    echo "Cannot read crontab safely; no jobs changed. / 无法读取 crontab，未修改任务。" >&2
+    return 1
+}
+installCronTLS() {
+    [[ -z "${btDomain}" ]] || return 0
+    local staging result=1
+    local job="30 1 * * * /bin/bash /etc/v2ray-agent/install.sh RenewTLS >> /etc/v2ray-agent/crontab_tls.log 2>&1"
+    staging=$(umask 077; mktemp -d /etc/v2ray-agent/.cron-tls.XXXXXXXX) || return 1
+    if agentReadCrontab "$staging/before" "$staging/errors" &&
+        awk -v job="$job" '$0 != job && $0 != job " # v2ray-agent:tls-renewal" {print}' \
+            "$staging/before" >"$staging/candidate" &&
+        printf '%s # v2ray-agent:tls-renewal\n' "$job" >>"$staging/candidate" &&
+        agentReadCrontab "$staging/current" "$staging/errors" &&
+        cmp -s "$staging/before" "$staging/current" &&
+        chmod 600 "$staging/before" &&
+        mv -fT -- "$staging/before" /etc/v2ray-agent/backup_crontab.cron &&
+        crontab "$staging/candidate"; then
+        echoContent green " ---> TLS renewal job installed; other jobs preserved. / 证书续期任务已添加，其他任务已保留。"
+        result=0
+    else
+        echo "TLS crontab update failed; check crontab and its backup. / 定时任务更新失败，请核对当前任务与备份。" >&2
+    fi
+    rm -rf -- "$staging"
+    return "$result"
 }
 # Scheduled tasks update geo files
 installCronUpdateGeo() {
@@ -2711,25 +2740,138 @@ xrayVersionManageMenu() {
 }
 
 # Update geosite
+agentGeoDigest() {
+    (
+        set -o pipefail
+        {
+            local name path
+            for name in xray geosite.dat geoip.dat; do
+                path="/etc/v2ray-agent/xray/$name"
+                if [[ -e "$path" || -L "$path" ]]; then
+                    [[ -f "$path" && ! -L "$path" ]] || exit 1
+                    sha256sum "$path" || exit 1
+                else
+                    printf 'absent:%s\n' "$name"
+                fi
+            done
+        } | sha256sum
+    )
+}
+agentGeoRecoveryClear() {
+    local marker
+    for marker in /etc/v2ray-agent/xray/.geo-update.*/KEEP_RECOVERY; do
+        if [[ -e "$marker" || -L "$marker" ]]; then
+            echo "Unfinished Geo update; inspect recovery files first: $marker" >&2
+            return 1
+        fi
+    done
+}
+agentDownloadGeo() {
+    local staging=$1 version name expected actual checksum
+    local curlArgs=(--fail --silent --show-error --location --proto '=https' --proto-redir '=https'
+                    --tlsv1.2 --connect-timeout 15 --max-time 120)
+    curl "${curlArgs[@]}" https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest \
+        -o "$staging/release.json" || return 1
+    version=$(jq -er '.tag_name | select(type == "string")' "$staging/release.json") || return 1
+    [[ "$version" =~ ^[0-9]{12}$ ]] || return 1
+    for name in geosite.dat geoip.dat; do
+        curl "${curlArgs[@]}" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/$version/$name" \
+            -o "$staging/$name" || return 1
+        curl "${curlArgs[@]}" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/$version/$name.sha256sum" \
+            -o "$staging/$name.sha256sum" || return 1
+        [[ -s "$staging/$name" ]] || return 1
+        checksum=$(<"$staging/$name.sha256sum")
+        [[ "$checksum" =~ ^([a-fA-F0-9]{64})[[:space:]]+\*?${name//./\\.}$ ]] || return 1
+        expected="${BASH_REMATCH[1],,}"
+        actual=$(sha256sum "$staging/$name") || return 1
+        [[ "${actual%% *}" == "$expected" ]] || return 1
+        chmod 644 "$staging/$name" || return 1
+    done
+    # Exercise both databases even when the installed configuration does not use Geo.
+    printf '%s\n' '{"outbounds":[{"protocol":"freedom","tag":"direct"}],"routing":{"rules":[{"type":"field","domain":["geosite:cn"],"outboundTag":"direct"},{"type":"field","ip":["geoip:cn"],"outboundTag":"direct"}]}}' \
+        >"$staging/check.json" || return 1
+    timeout --kill-after=1s 20s env xray.location.asset="$staging" XRAY_LOCATION_ASSET="$staging" /etc/v2ray-agent/xray/xray \
+        run -test -config "$staging/check.json" || return 1
+    timeout --kill-after=1s 20s env xray.location.asset="$staging" XRAY_LOCATION_ASSET="$staging" /etc/v2ray-agent/xray/xray \
+        run -test -confdir /etc/v2ray-agent/xray/conf || return 1
+    printf '%s\n' "$version" >"$staging/version"
+}
+agentPublishGeo() {
+    # Subshell traps do not replace the installer's traps. The caller holds fd 9.
+    (
+        local staging=$1 name committed=0 restored=1
+        for name in geosite.dat geoip.dat; do
+            if [[ -e "/etc/v2ray-agent/xray/$name" ]]; then
+                cp -p -- "/etc/v2ray-agent/xray/$name" "$staging/$name.previous" || exit 1
+                chmod --reference="/etc/v2ray-agent/xray/$name" "$staging/$name" || exit 1
+            else
+                touch "$staging/$name.absent" || exit 1
+            fi
+        done
+        trap '
+            if [[ "$committed" == 1 ]]; then
+                for name in geosite.dat geoip.dat; do
+                    if [[ -f "$staging/$name.previous" ]]; then
+                        cp -p -- "$staging/$name.previous" "$staging/$name.restore" &&
+                            mv -fT -- "$staging/$name.restore" "/etc/v2ray-agent/xray/$name" || restored=0
+                    elif [[ -f "$staging/$name.absent" ]]; then
+                        rm -f -- "/etc/v2ray-agent/xray/$name" || restored=0
+                    else
+                        restored=0
+                    fi
+                done
+                if [[ "$restored" == 1 ]]; then
+                    rm -f -- "$staging/KEEP_RECOVERY"
+                    # Best-effort request only: do not wait again with the shared lock.
+                    timeout --kill-after=1s 2s systemctl --no-block restart xray 9>&- || true
+                    echo "Old Geo files restored; verify Xray service status. / 已恢复旧数据，请检查 Xray 服务。" >&2
+                else
+                    echo "Geo restoration failed; recovery files retained: $staging" >&2
+                fi
+            fi
+        ' EXIT
+        trap 'exit 1' INT TERM HUP
+        printf '%s\n' "Unfinished Geo publication. Restore *.previous or honor *.absent; verify Xray before clearing." \
+            >"$staging/KEEP_RECOVERY" || exit 1
+        committed=1
+        for name in geosite.dat geoip.dat; do
+            mv -fT -- "$staging/$name" "/etc/v2ray-agent/xray/$name" || exit 1
+        done
+        # Bound the short commit phase; never call legacy reloadCore (which can exit 0 on failure).
+        timeout --kill-after=1s 5s systemctl restart xray 9>&- || exit 1
+        timeout --kill-after=1s 2s systemctl is-active --quiet xray 9>&- || exit 1
+        committed=0
+        rm -f -- "$staging/KEEP_RECOVERY" || exit 1
+    )
+}
 updateGeoSite() {
-    echoContent yellow "1.Upgrade v2ray-core"
-
-    version=$(curl -s https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases?per_page=1 | jq -r '.[]|.tag_name')
-    echoContent skyBlue "------------------------Version-------------------------------"
-    echo "version:${version}"
-    rm ${configPath}../geo* >/dev/null
-
-    if [[ "${release}" == "alpine" ]]; then
-        wget -c -q -P ${configPath}../ "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geosite.dat"
-        wget -c -q -P ${configPath}../ "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geoip.dat"
-    else
-        wget -c -q "${wgetShowProgressStatus}" -P ${configPath}../ "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geosite.dat"
-        wget -c -q "${wgetShowProgressStatus}" -P ${configPath}../ "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geoip.dat"
+    local staging before after result=1
+    if [[ "${release}" == alpine || "${configPath%/}" != /etc/v2ray-agent/xray/conf ||
+        -L /etc/v2ray-agent/xray || -L /etc/v2ray-agent/xray/conf ||
+        ! -d /etc/v2ray-agent/xray/conf || ! -x /etc/v2ray-agent/xray/xray ]]; then
+        echo "Safe Geo update requires the standard systemd Xray installation; nothing changed." >&2
+        return 1
     fi
-
-    reloadCore
-        echoContent green " ---> Tuic version:${version}"
-
+    command -v timeout >/dev/null && command -v systemctl >/dev/null || return 1
+    agentWriteLock || return 1
+    agentGeoRecoveryClear || return 1
+    before=$(agentGeoDigest) || return 1
+    staging=$(umask 077; mktemp -d /etc/v2ray-agent/xray/.geo-update.XXXXXXXX) || return 1
+    if agentPrepare agentDownloadGeo "$staging" &&
+        agentGeoRecoveryClear &&
+        after=$(agentGeoDigest) && [[ "$before" == "$after" ]] &&
+        agentPublishGeo "$staging"; then
+        echoContent green " ---> Geo files verified and Xray restart checked: $(<"$staging/version")"
+        result=0
+    else
+        echo "Geo update failed; no success claimed. / Geo 更新失败，请检查上述错误及服务状态。" >&2
+    fi
+    if [[ -e "$staging/KEEP_RECOVERY" ]]; then
+        echo "Recovery files retained: $staging" >&2
+    else
+        rm -rf -- "$staging"
+    fi
+    return "$result"
 }
 
 # Update Xray
@@ -3357,22 +3499,40 @@ readPortHopping() {
     fi
 }
 deletePortHoppingRules() {
-    local type=$1
-    local start=$2
-    local end=$3
-    local targetPort=$4
-
+    local type=$1 start=$2 end=$3 targetPort=$4 port status changed=0
+    [[ "$type" == hysteria2 || "$type" == tuic ]] || return 1
+    for port in "$start" "$end" "$targetPort"; do
+        [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && ((port <= 65535)) || {
+            echo "Invalid port-hopping rule; nothing removed. / 规则参数无效，未删除。" >&2
+            return 1
+        }
+    done
+    ((start <= end)) || return 1
     if [[ "${release}" == "centos" ]]; then
-        for port in $(seq "${start}" "${end}"); do
-            sudo firewall-cmd --permanent --remove-forward-port=port="${port}":proto=udp:toport="${targetPort}"
+        for ((port = start; port <= end; port++)); do
+            sudo firewall-cmd --permanent --remove-forward-port="port=${port}:proto=udp:toport=${targetPort}" || return 1
         done
-        sudo firewall-cmd --reload
+        sudo firewall-cmd --reload || return 1
     else
-        iptables -t nat -L PREROUTING --line-numbers | grep "mack-a_${type}_portHopping" | awk '{print $1}' | while read -r line; do
-            iptables -t nat -D PREROUTING 1
-            sudo netfilter-persistent save
+        local rule=(-p udp --dport "$start:$end" -m comment --comment "mack-a_${type}_portHopping"
+                    -j DNAT --to-destination ":$targetPort")
+        # Delete the exact owned specification, never a changing line number.
+        while true; do
+            iptables -w 5 -t nat -C PREROUTING "${rule[@]}"
+            status=$?
+            if [[ "$status" == 1 ]]; then
+                break
+            elif [[ "$status" != 0 ]]; then
+                return 1
+            fi
+            iptables -w 5 -t nat -D PREROUTING "${rule[@]}" || return 1
+            changed=1
         done
+        if [[ "$changed" == 1 ]]; then
+            sudo netfilter-persistent save || return 1
+        fi
     fi
+    return 0
 }
 
 portHoppingMenu() {
@@ -3408,7 +3568,7 @@ portHoppingMenu() {
     if [[ "${selectPortHoppingStatus}" == "1" ]]; then
         addPortHopping "${type}" "${targetPort}"
     elif [[ "${selectPortHoppingStatus}" == "2" ]]; then
-        deletePortHoppingRules "${type}" "${portHoppingStart}" "${portHoppingEnd}" "${targetPort}"
+        deletePortHoppingRules "${type}" "${portHoppingStart}" "${portHoppingEnd}" "${targetPort}" || return 1
         echoContent green " ---> Configuring Tuic to start automatically at boot"
     elif [[ "${selectPortHoppingStatus}" == "3" ]]; then
         if [[ -n "${portHoppingStart}" && -n "${portHoppingEnd}" ]]; then
@@ -8898,7 +9058,7 @@ cronFunction() {
         renewalTLS
         exit 0
     elif [[ "${cronName}" == "UpdateGeo" ]]; then
-        updateGeoSite >>/etc/v2ray-agent/crontab_updateGeoSite.log
+        updateGeoSite >>/etc/v2ray-agent/crontab_updateGeoSite.log 2>&1 || exit 1
         echoContent green " ---> geo update date: $(date "+%F %H:%M:%S")" >>/etc/v2ray-agent/crontab_updateGeoSite.log
         exit 0
     fi
@@ -10298,7 +10458,7 @@ singBoxVersionManageMenu() {
 # main menu
 menu() {
     cd "$HOME" || exit
-    echoContent green "Current version: v3.5.24-port.3"
+    echoContent green "Current version: v3.5.24-port.4"
     echoContent red "\n=============================================================="
         echoContent green " ---> WARP offload uninstall successful"
         echoContent green " ---> Added shunt successfully"
