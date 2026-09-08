@@ -5,7 +5,7 @@
 
 基于 [mack-a/v2ray-agent](https://github.com/mack-a/v2ray-agent) 的 Xray-core / sing-box 管理脚本。本仓库保留原有安装、协议、账户和订阅管理能力，并将主菜单 **12「添加新端口」升级为「端口管理」**。
 
-当前脚本版本：`v3.5.24-port.3`。本轮阻止账户撤销将辅助 SOCKS5 入口变成免认证，修正客户端默认安全、换 Salt 后旧订阅撤销和辅助 TLS 备份；自更新及模块下载改为解锁准备、核对后提交。真实核心、内核规则和客户端验收仍待完成；单端口限速为实验性功能。
+当前脚本版本：`v3.5.24-port.4`。本轮修正独立 Geo 更新的持锁下载、丢旧数据和误报成功，收紧 NAT 删除、包管理进程和证书 cron 的操作范围，停用 UFW 全表清理，并修正发布工作流。真实核心、内核规则和客户端验收仍待完成；单端口限速为实验性功能。
 
 ## 本版新增
 
@@ -63,6 +63,16 @@ curl --fail --location --proto '=https' --tlsv1.2 "https://raw.githubusercontent
 
 首次进入端口管理会安装对应的模块。首次使用额度、到期或限速功能时，菜单会提示确认安装后台服务及核心启动依赖，不需要重装协议或重新创建账户。
 
+### Geo 更新与主机维护
+
+Xray 菜单的 Geo 更新及 `UpdateGeo` 定时入口先在私有目录下载两个数据库及 SHA-256 校验文件，并调用已安装核心检查候选数据和配置；准备期间释放共用写锁。取锁复核后仅替换 `geosite.dat`、`geoip.dat`，不删除其他 `geo*` 文件。下载或校验失败保留旧数据；替换、服务重启失败或可捕获信号触发文件补偿，cron 返回失败，不再输出成功时间。
+
+该安全更新入口要求标准目录的 systemd Xray 安装；Alpine/OpenRC 和自定义路径拒绝自动更新。重启等待有超时，成功提示仅代表配置检查和当时的服务状态通过，不代表公网连通性通过。若提示保留恢复目录，请先按 [Geo 恢复说明](documents/security-followup-74a1a73d-2026-09-08.md#geo-恢复与验证边界) 核对，不能仅删除 `KEEP_RECOVERY`。核心安装/升级中另一条旧 Geo 下载路径尚未整改。
+
+安装器检测到包管理器忙时会退出，请等待已有任务结束后重试；不再强杀 apt 或删除 yum 的 PID 文件。证书 cron 只替换精确匹配的标准续期作业，保留 Geo、其他 ACME、监控及自定义作业，旧表备份为 `backup_crontab.cron`。已修改过命令或时间的续期作业也会保留，需自行检查是否重复。
+
+独立 `shell/ufw_remove.sh` 已停用，只提示并返回失败，不再修改防火墙或服务。历史 Release 和标签不再自动清理；完整的 `-port.*` 版本按预发布发布，不覆盖稳定版 latest。
+
 ## 端口管理菜单
 
 运行 `vasma`，选择 **12「端口管理」**：
@@ -104,13 +114,13 @@ curl --fail --location --proto '=https' --tlsv1.2 "https://raw.githubusercontent
 
 **限速仍有实质边界：** 当前 flower 端口分类不能覆盖非首个 IP 分片，因此尚不能保证严格的端口带宽上限。首次接入只接受空/noqueue 或本模块已拥有的队列结构；`mq`、`fq_codel`、未知 QoS 和多个外部接口会被拒绝。`applied=true` 仅表示对象安装核验通过，不代表真实吞吐验收通过。
 
-**策略刷新仍受旧写入流程影响：** 日志跟随、等待输入、自更新和模块下载已释放共用写锁；Xray/sing-box 核心升级、Geo 更新、订阅远程模板下载等其他旧流程仍可能长时间持锁，阻塞后台刷新。超过 30 秒策略有效期后，纳管入口可能被保守阻断。这一 R01 剩余问题尚未关闭。
+**策略刷新仍受旧写入流程影响：** 日志跟随、等待输入、自更新、模块下载及独立 Geo 更新的下载/校验阶段已释放共用写锁；Xray/sing-box 核心安装和升级（包括其中的旧 Geo 下载）、订阅远程模板下载等其他旧流程仍可能长时间持锁，阻塞后台刷新。超过 30 秒策略有效期后，纳管入口可能被保守阻断。这一 R01 剩余问题尚未关闭。
 
 删除主账户会联动使用相同凭证的辅助入口。如果将删空 SOCKS、HTTP 或 mixed 入站的认证用户列表，整批删除会被拒绝并保留原配置。请先为辅助入口设置独立凭证或禁用该入口，再重新删除。
 
 新生成的 Clash 完整配置默认只允许本机访问代理、管理接口及 DNS；Trojan gRPC 的 sing-box 订阅恢复证书校验。已下载的旧配置需要重新拉取。换 Salt 时先准备新订阅，再撤销五种格式的旧生成地址；普通发布失败尝试补偿，中断后若保留恢复目录会明确提示。订阅生成现在需要 Python 3。
 
-这些改动不代表全部账户、订阅和更新流程已完成整改。剩余审计项及准确验证范围见 [本轮安全修正记录](documents/security-followup-5748474d-2026-09-08.md)。
+这些改动不代表全部账户、订阅和更新流程已完成整改。R01、A10、A11、A12 仍有剩余工作；准确验证范围见 [本轮安全修正记录](documents/security-followup-74a1a73d-2026-09-08.md)。此前的认证删空保护不会自动修复已经存在的空认证列表，Clash 回环监听也不等于管理 API 已配置认证。
 
 旧防火墙放行规则采用保留策略，不会清空整机规则。异常断电或计数器代次丢失会保留可信用量并采取保守限制；目前没有完整的全量退役和普通用户故障校正向导，不应直接删除账本、规则表或队列解除限制。
 
@@ -118,7 +128,7 @@ curl --fail --location --proto '=https' --tlsv1.2 "https://raw.githubusercontent
 
 ## 测试与验证
 
-本轮 **186 项本地隔离回归全部通过**，增加认证删空、慢下载并发续期、实际客户端生成器、Salt 撤销及私有 TLS 备份测试，完整结果见 [本轮安全修正记录](documents/security-followup-5748474d-2026-09-08.md)。云端 CI 状态见页首徽章及对应提交的检查页。测试使用临时目录、合成账户和模拟系统执行器，没有操作实际代理服务器。真实核心、内核流量、双栈、重启/断电和客户端验收尚待完成。
+本轮 **227 项本地隔离回归全部通过，0 失败、0 跳过**，其中新增 41 项 Geo、主机操作范围及发布工作流测试；完整结果见 [本轮安全修正记录](documents/security-followup-74a1a73d-2026-09-08.md)。云端 CI 状态见页首徽章及对应提交的检查页。测试使用临时目录、合成账户和模拟系统执行器，没有操作实际代理服务器。真实核心、内核流量、双栈、重启/断电和客户端验收尚待完成。
 
 在仓库目录复现：
 
@@ -126,10 +136,12 @@ curl --fail --location --proto '=https' --tlsv1.2 "https://raw.githubusercontent
 bash -n install.sh
 bash -n shell/install_en.sh
 bash -n shell/init_tls.sh
+bash -n shell/ufw_remove.sh
+node --check .github/scripts/release.cjs
 PYTHONPATH=shell python3 -m unittest discover -s tests -p 'test_port*.py' -q
 ```
 
-需要 Python 3.9+、PyYAML、Bash、jq 和 util-linux；非 root 环境会跳过要求 root 的安装器锁测试。详细结果与待验证项见 [实施验证记录](documents/port-management-validation.md)。
+需要 Python 3.9+、PyYAML、Bash、jq、util-linux、GNU coreutils 和 Node.js 18+；Node.js 仅用于仓库发布回归，不是节点运行依赖。非 root 环境会跳过要求 root 的安装器锁测试。详细结果与待验证项见 [实施验证记录](documents/port-management-validation.md)。
 
 ## 文档与反馈
 
@@ -137,6 +149,7 @@ PYTHONPATH=shell python3 -m unittest discover -s tests -p 'test_port*.py' -q
 - [端口管理实施验证记录](documents/port-management-validation.md)
 - [2026-09-08 复核修正范围与剩余问题](documents/audit-followup-2026-09-08.md)
 - [5748474d 后的安全修正与验证](documents/security-followup-5748474d-2026-09-08.md)
+- [74a1a73d 后的 Geo、主机操作与发布修正](documents/security-followup-74a1a73d-2026-09-08.md)
 - [提交本修改版的问题](https://github.com/ECHOAPi/v2ray-agent/issues)
 - [本仓库 CI](https://github.com/ECHOAPi/v2ray-agent/actions)
 - [上游基础使用教程](https://www.v2ray-agent.com/archives/1710141233)
