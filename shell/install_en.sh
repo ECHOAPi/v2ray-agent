@@ -213,7 +213,19 @@ portManager() {
     agentWriteLock || return 1
     return "$result"
 }
+agentManagedRecoveryClear() {
+    local marker
+    for marker in /etc/v2ray-agent/xray/.core-update.*/KEEP_RECOVERY \
+        /etc/v2ray-agent/sing-box/.core-update.*/KEEP_RECOVERY \
+        /etc/v2ray-agent/xray/.geo-update.*/KEEP_RECOVERY; do
+        if [[ -e "$marker" || -L "$marker" ]]; then
+            echo "Unfinished core/Geo publication blocks installer writes; inspect: $marker" >&2
+            return 1
+        fi
+    done
+}
 agentRecoverBeforeLegacy() {
+    agentManagedRecoveryClear || return 1
     if [[ -d /etc/v2ray-agent/port-manager/transactions || \
           -f /etc/v2ray-agent/port-manager/policies.sqlite3 || \
           -f /etc/v2ray-agent/port-manager/rates.json ]]; then
@@ -2560,59 +2572,360 @@ renewalTLS() {
     fi
 }
 
-installSingBox() {
-    readInstallType
-        echoContent skyBlue " ---> Certificate generation days: ${days}"
-
-    if [[ ! -f "/etc/v2ray-agent/sing-box/sing-box" ]]; then
-
-        if [[ "${prereleaseStatus}" == "true" ]]; then
-            version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases?per_page=20" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
-        else
-            version=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
-        fi
-
-            echoContent green " ---> Lock v2ray-core version to v4.32.1"
-
-        if [[ "${release}" == "alpine" ]]; then
-            wget -c -q -P /etc/v2ray-agent/sing-box/ "https://github.com/SagerNet/sing-box/releases/download/${version}/sing-box-${version/v/}${singBoxCoreCPUVendor}.tar.gz"
-        else
-            wget -c -q "${wgetShowProgressStatus}" -P /etc/v2ray-agent/sing-box/ "https://github.com/SagerNet/sing-box/releases/download/${version}/sing-box-${version/v/}${singBoxCoreCPUVendor}.tar.gz"
-        fi
-
-        if [[ ! -f "/etc/v2ray-agent/sing-box/sing-box-${version/v/}${singBoxCoreCPUVendor}.tar.gz" ]]; then
-            read -r -p "Core download failed. Retry installation? [y/n]" downloadStatus
-            if [[ "${downloadStatus}" == "y" ]]; then
-                installSingBox "$1"
+agentCoreDirectory() {
+    local core=$1 path
+    [[ "$core" == xray || "$core" == sing-box ]] || return 1
+    agentWriteLock || return 1
+    for path in /etc/v2ray-agent "/etc/v2ray-agent/$core"; do
+        [[ -e "$path" || -L "$path" ]] || (umask 077; mkdir "$path") || return 1
+        [[ -d "$path" && ! -L "$path" && -O "$path" ]] &&
+            (( (8#$(stat -c %a "$path") & 0022) == 0 )) || {
+            echo "Untrusted core directory; no update. / 核心目录不可信，未更新。" >&2
+            return 1
+        }
+    done
+    [[ "${release}" != alpine ]] || {
+        echo "Safe core updates currently require systemd, not OpenRC." >&2
+        return 1
+    }
+    command -v python3 >/dev/null && command -v timeout >/dev/null &&
+        command -v systemctl >/dev/null || return 1
+}
+agentCoreDigest() {
+    (
+        set -o pipefail
+        local core=$1 path name
+        [[ "$core" == xray || "$core" == sing-box ]] || exit 1
+        {
+            for path in "/etc/v2ray-agent/$core/$core" "/etc/systemd/system/$core.service"; do
+                if [[ -e "$path" || -L "$path" ]]; then
+                    [[ -f "$path" && ! -L "$path" ]] || exit 1
+                    stat -c '%n:%f:%u:%g' "$path" || exit 1
+                    sha256sum "$path" || exit 1
+                else
+                    printf 'absent:%s\n' "$path"
+                fi
+            done
+            if [[ "$core" == xray ]]; then
+                agentGeoDigest || exit 1
             fi
-        else
-
-            tar zxvf "/etc/v2ray-agent/sing-box/sing-box-${version/v/}${singBoxCoreCPUVendor}.tar.gz" -C "/etc/v2ray-agent/sing-box/" >/dev/null 2>&1
-
-            mv "/etc/v2ray-agent/sing-box/sing-box-${version/v/}${singBoxCoreCPUVendor}/sing-box" /etc/v2ray-agent/sing-box/sing-box
-            rm -rf /etc/v2ray-agent/sing-box/sing-box-*
-            chmod 655 /etc/v2ray-agent/sing-box/sing-box
+            # The standard installation references credentials in this directory.
+            if [[ -d /etc/v2ray-agent/tls ]]; then
+                find -L /etc/v2ray-agent/tls -type f -print0 | sort -z | xargs -0 -r sha256sum || exit 1
+            fi
+            path="/etc/systemd/system/$core.service.d"
+            if [[ -d "$path" ]]; then
+                find -L "$path" -type f -print0 | sort -z | xargs -0 -r sha256sum || exit 1
+            fi
+        } | sha256sum
+    )
+}
+agentCoreServiceState() {
+    local core=$1 status user=missing state details line dynamic fragment command= expected
+    if [[ ! -e "/etc/systemd/system/$core.service" ]]; then
+        if [[ -e "/etc/v2ray-agent/$core/$core" ]]; then
+            echo "Existing core has no standard systemd unit; manual coordination required." >&2
+            return 1
         fi
+        printf '%s\n' absent
+        return 0
+    fi
+    details=$(timeout --kill-after=1s 2s systemctl show -p User -p DynamicUser -p FragmentPath -p ExecStart "$core.service" 9>&-) || return 1
+    while IFS= builtin read -r line; do
+        case "$line" in
+            User=*) user=${line#User=} ;;
+            DynamicUser=*) dynamic=${line#DynamicUser=} ;;
+            FragmentPath=*) fragment=${line#FragmentPath=} ;;
+            ExecStart=*) [[ -z "$command" ]] || return 1; command=${line#ExecStart=} ;;
+        esac
+    done <<<"$details"
+    if [[ "$core" == xray ]]; then
+        expected="/etc/v2ray-agent/xray/xray run -confdir /etc/v2ray-agent/xray/conf"
     else
-        echoContent green " ---> Current version:v$(/etc/v2ray-agent/sing-box/sing-box version | grep "sing-box version" | awk '{print $3}')"
-
-        if [[ "${prereleaseStatus}" == "true" ]]; then
-            version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases?per_page=20" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
-        else
-            version=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
-        fi
-
-            echoContent green " ---> v2ray-core version:$(/etc/v2ray-agent/v2ray/v2ray --version | awk '{print $2}' | head -1)"
-
-        if [[ -z "${lastInstallationConfig}" ]]; then
-            read -r -p "Update or upgrade? [y/n]:" reInstallSingBoxStatus
-            if [[ "${reInstallSingBoxStatus}" == "y" ]]; then
-                rm -f /etc/v2ray-agent/sing-box/sing-box
-                installSingBox "$1"
-            fi
+        expected="/etc/v2ray-agent/sing-box/sing-box run -c /etc/v2ray-agent/sing-box/conf/config.json"
+    fi
+    [[ ( -z "$user" || "$user" == root ) && "$dynamic" == no &&
+        "$fragment" == "/etc/systemd/system/$core.service" &&
+        "$command" == "{ path=/etc/v2ray-agent/$core/$core ; argv[]=$expected ; "* ]] || {
+        echo "Non-standard/non-root core service requires manual coordination and permission review." >&2
+        return 1
+    }
+    state=$(timeout --kill-after=1s 2s systemctl is-active "$core.service" 9>&-)
+    status=$?
+    case "$status:$state" in
+        0:active) printf '%s\n' active ;;
+        3:inactive) printf '%s\n' inactive ;;
+        *) echo "Cannot determine core service state; no update." >&2; return 1 ;;
+    esac
+}
+agentFetchCoreReleases() {
+    local core=$1 staging=$2 repository
+    case "$core" in
+        xray) repository=XTLS/Xray-core ;;
+        sing-box) repository=SagerNet/sing-box ;;
+        *) return 1 ;;
+    esac
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --connect-timeout 15 --max-time 120 \
+        "https://api.github.com/repos/$repository/releases?per_page=20" -o "$staging/releases.json"
+}
+agentChooseCoreVersion() {
+    local core=$1 staging selected tag result=1
+    local versions=()
+    selectedCoreVersion=
+    agentCoreDirectory "$core" && agentManagedRecoveryClear || return 1
+    staging=$(umask 077; mktemp -d "/etc/v2ray-agent/$core/.core-versions.XXXXXXXX") || return 1
+    if agentPrepare agentFetchCoreReleases "$core" "$staging" &&
+        jq -er '[.[] | select(.draft == false and .prerelease == false) | .tag_name][:5][]' \
+            "$staging/releases.json" >"$staging/versions"; then
+        mapfile -t versions <"$staging/versions"
+        for tag in "${versions[@]}"; do
+            [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+([.-][A-Za-z0-9]+)*)?$ ]] || {
+                rm -rf -- "$staging"; return 1;
+            }
+        done
+        printf '%s\n' "${versions[@]}" | awk '{print NR ":" $0}'
+        if read -r -p "Version number / 版本序号: " selected &&
+            [[ "$selected" =~ ^[1-5]$ ]] && ((selected <= ${#versions[@]})); then
+            selectedCoreVersion="${versions[selected-1]}"
+            result=0
         fi
     fi
+    rm -rf -- "$staging"
+    return "$result"
+}
+agentExtractCore() {
+    # Only one explicitly named regular archive member is written, never extractall.
+    python3 - "$@" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+import tarfile
+import zipfile
 
+core, archive, destination, member_name = sys.argv[1:]
+limit = 256 * 1024 * 1024
+if core not in ("xray", "sing-box") or Path(archive).stat().st_size > limit:
+    raise SystemExit("Unsupported or oversized core archive")
+container = zipfile.ZipFile(archive) if core == "xray" else tarfile.open(archive, "r:gz")
+with container:
+    members = container.infolist() if core == "xray" else container.getmembers()
+    found = [item for item in members if (item.filename if core == "xray" else item.name) == member_name]
+    if len(found) != 1:
+        raise SystemExit("Core archive must contain exactly one expected binary")
+    item = found[0]
+    if core == "xray":
+        kind = stat.S_IFMT(item.external_attr >> 16)
+        if item.is_dir() or kind not in (0, stat.S_IFREG) or item.flag_bits & 1:
+            raise SystemExit("Core archive member is not a plain file")
+        size, stream = item.file_size, container.open(item)
+    else:
+        if not item.isfile():
+            raise SystemExit("Core archive member is not a regular file")
+        size, stream = item.size, container.extractfile(item)
+    if not 0 < size <= limit:
+        raise SystemExit("Empty or oversized core binary")
+    with stream, open(destination, "xb") as output:
+        remaining = size
+        while remaining:
+            chunk = stream.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise SystemExit("Truncated core binary")
+            output.write(chunk)
+            remaining -= len(chunk)
+    os.chmod(destination, 0o755)
+PY
+}
+agentPrepareCore() {
+    local core=$1 staging=$2 requested=$3 preview=$4 repository endpoint tag asset digest actual member observed
+    local curlArgs=(--fail --silent --show-error --location --proto '=https' --proto-redir '=https'
+                    --tlsv1.2 --connect-timeout 15 --max-time 120 --max-filesize 268435456)
+    case "$core" in
+        xray)
+            repository=XTLS/Xray-core
+            [[ "$xrayCoreCPUVendor" == Xray-linux-64 || "$xrayCoreCPUVendor" == Xray-linux-arm64-v8a ]] || return 1
+            ;;
+        sing-box)
+            repository=SagerNet/sing-box
+            [[ "$singBoxCoreCPUVendor" == -linux-amd64 || "$singBoxCoreCPUVendor" == -linux-arm64 ]] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    [[ "$preview" == true || "$preview" == false ]] || return 1
+    if [[ -n "$requested" ]]; then
+        [[ "$requested" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+([.-][A-Za-z0-9]+)*)?$ ]] || return 1
+        endpoint="tags/$requested"
+    elif [[ "$preview" == true ]]; then
+        agentFetchCoreReleases "$core" "$staging" || return 1
+        jq -e '[.[] | select(.draft == false and .prerelease == true)][0]' "$staging/releases.json" \
+            >"$staging/release.json" || return 1
+        endpoint=
+    else
+        endpoint=latest
+    fi
+    if [[ -n "$endpoint" ]]; then
+        curl "${curlArgs[@]}" "https://api.github.com/repos/$repository/releases/$endpoint" \
+            -o "$staging/release.json" || return 1
+    fi
+    tag=$(jq -er '.tag_name | select(type == "string")' "$staging/release.json") || return 1
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+([.-][A-Za-z0-9]+)*)?$ ]] || return 1
+    [[ -z "$requested" || "$tag" == "$requested" ]] || return 1
+    jq -e '.draft == false' "$staging/release.json" >/dev/null || return 1
+    if [[ -z "$requested" && "$preview" == false ]]; then
+        jq -e '.prerelease == false' "$staging/release.json" >/dev/null || return 1
+    fi
+    if [[ "$core" == xray ]]; then
+        asset="$xrayCoreCPUVendor.zip"
+        member=xray
+    else
+        asset="sing-box-${tag#v}$singBoxCoreCPUVendor.tar.gz"
+        member="sing-box-${tag#v}$singBoxCoreCPUVendor/sing-box"
+    fi
+    digest=$(jq -er --arg asset "$asset" '[.assets[] | select(.name == $asset)] |
+        select(length == 1) | .[0].digest | select(type == "string")' "$staging/release.json") || return 1
+    [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+        echo "Release has no usable SHA-256 digest; refusing an unchecked core." >&2
+        return 1
+    }
+    curl "${curlArgs[@]}" "https://github.com/$repository/releases/download/$tag/$asset" \
+        -o "$staging/archive" || return 1
+    actual=$(sha256sum "$staging/archive") || return 1
+    [[ "${actual%% *}" == "${digest#sha256:}" ]] || return 1
+    mkdir -m 700 "$staging/candidate" || return 1
+    agentExtractCore "$core" "$staging/archive" "$staging/candidate/$core" "$member" || return 1
+    observed=$(timeout --kill-after=1s 5s "$staging/candidate/$core" version) || return 1
+    if [[ "$core" == xray ]]; then
+        observed=$(printf '%s\n' "$observed" | awk 'NR==1 && $1=="Xray" {print "v"$2}')
+    else
+        observed=$(printf '%s\n' "$observed" | awk 'NR==1 && $1=="sing-box" && $2=="version" {print "v"$3}')
+    fi
+    [[ "$observed" == "$tag" ]] || { echo "Downloaded core reports an unexpected version." >&2; return 1; }
+    if [[ "$core" == xray ]]; then
+        local checkConfig=false path
+        [[ ! -L /etc/v2ray-agent/xray/conf ]] || return 1
+        for path in /etc/v2ray-agent/xray/conf/*.json; do
+            [[ -e "$path" || -L "$path" ]] || continue
+            [[ -f "$path" && ! -L "$path" ]] || return 1
+            checkConfig=true
+        done
+        agentDownloadGeo "$staging/candidate" "$staging/candidate/xray" "$checkConfig" || return 1
+    else
+        agentBuildSingBoxCandidate "$staging/build" "$staging/candidate/sing-box" || return 1
+        if [[ -f "$staging/build/config.json" ]]; then
+            mkdir -m 700 "$staging/candidate/conf" &&
+                mv -- "$staging/build/config.json" "$staging/candidate/conf/config.json" || return 1
+        fi
+        rm -rf -- "$staging/build"
+    fi
+    rm -f -- "$staging/archive" || return 1
+    printf '%s\n' "$tag" >"$staging/version"
+}
+agentPublishCore() {
+    (
+        local core=$1 staging=$2 state=$3 name committed=0 restored=1
+        local destination="/etc/v2ray-agent/$1"
+        local files=("$core")
+        if [[ "$core" == xray ]]; then
+            files+=(geosite.dat geoip.dat)
+        elif [[ -f "$staging/candidate/conf/config.json" ]]; then
+            files+=(conf/config.json)
+        fi
+        mkdir -m 700 "$staging/previous" "$staging/absent" || exit 1
+        for name in "${files[@]}"; do
+            mkdir -p -- "$staging/previous/$(dirname "$name")" "$staging/absent/$(dirname "$name")" || exit 1
+            if [[ -e "$destination/$name" || -L "$destination/$name" ]]; then
+                [[ -f "$destination/$name" && ! -L "$destination/$name" ]] || exit 1
+                cp -p -- "$destination/$name" "$staging/previous/$name" || exit 1
+                chmod --reference="$destination/$name" "$staging/candidate/$name" || exit 1
+            else
+                touch "$staging/absent/$name" || exit 1
+            fi
+        done
+        trap '
+            if [[ "$committed" == 1 ]]; then
+                for name in "${files[@]}"; do
+                    if [[ -f "$staging/previous/$name" ]]; then
+                        cp -p -- "$staging/previous/$name" "$staging/previous/$name.restore" &&
+                            mv -fT -- "$staging/previous/$name.restore" "$destination/$name" || restored=0
+                    elif [[ -f "$staging/absent/$name" ]]; then
+                        rm -f -- "$destination/$name" || restored=0
+                    else
+                        restored=0
+                    fi
+                done
+                if [[ "$restored" == 1 ]]; then
+                    rm -f -- "$staging/KEEP_RECOVERY"
+                    if [[ "$state" == active ]]; then
+                        timeout --kill-after=1s 2s systemctl --no-block restart "$core.service" 9>&- || true
+                    fi
+                    echo "Previous core files restored; verify service state. / 已恢复旧核心文件，请检查服务状态。" >&2
+                else
+                    echo "Core restoration failed; recovery required: $staging" >&2
+                fi
+            fi
+        ' EXIT
+        trap 'exit 1' INT TERM HUP
+        printf '%s\n' "${files[@]}" >"$staging/files" || exit 1
+        printf '%s\n' "Unfinished $core publication; inspect files, previous and absent before clearing." \
+            >"$staging/KEEP_RECOVERY" || exit 1
+        committed=1
+        for name in "${files[@]}"; do
+            mv -fT -- "$staging/candidate/$name" "$destination/$name" || exit 1
+        done
+        if [[ "$state" == active ]]; then
+            timeout --kill-after=1s 5s systemctl restart "$core.service" 9>&- || exit 1
+            timeout --kill-after=1s 2s systemctl is-active --quiet "$core.service" 9>&- || exit 1
+        fi
+        touch "$staging/COMPLETE" || exit 1
+        rm -f -- "$staging/KEEP_RECOVERY" || exit 1
+        committed=0
+    )
+}
+agentInstallCore() {
+    local core=$1 requested=${2:-} preview=${3:-false} staging before after state afterState backup
+    agentCoreDirectory "$core" && agentManagedRecoveryClear || return 1
+    before=$(agentCoreDigest "$core") && state=$(agentCoreServiceState "$core") || return 1
+    staging=$(umask 077; mktemp -d "/etc/v2ray-agent/$core/.core-update.XXXXXXXX") || return 1
+    if ! agentPrepare agentPrepareCore "$core" "$staging" "$requested" "$preview" ||
+        ! agentManagedRecoveryClear ||
+        ! after=$(agentCoreDigest "$core") || [[ "$before" != "$after" ]] ||
+        ! afterState=$(agentCoreServiceState "$core") || [[ "$state" != "$afterState" ]] ||
+        ! agentPublishCore "$core" "$staging" "$state"; then
+        echo "Core update failed; no success claimed. / 核心更新失败。" >&2
+        if [[ -e "$staging/KEEP_RECOVERY" ]]; then
+            echo "Recovery files retained: $staging" >&2
+        else
+            rm -rf -- "$staging"
+        fi
+        return 1
+    fi
+    backup="${staging/.core-update./.core-backup.}"
+    if mv -T -- "$staging" "$backup"; then
+        staging=$backup
+    else
+        echo "Backup retained under its original private directory." >&2
+    fi
+    echoContent green " ---> $core $(<"$staging/version") files verified and installed; prior service state: $state"
+    echoContent yellow " ---> Previous files / 旧文件备份: $staging"
+    return 0
+}
+installSingBox() {
+    local answer
+    readInstallType
+    if [[ -e /etc/v2ray-agent/sing-box/sing-box ]]; then
+        [[ -z "${lastInstallationConfig}" ]] || return 0
+        read -r -p "Update sing-box core / 更新 sing-box 核心？[y/n]: " answer || return 1
+        [[ "$answer" == y ]] || return 0
+    fi
+    agentInstallCore sing-box "" "${prereleaseStatus:-false}"
+}
+updateSingBox() {
+    local answer
+    [[ -f /etc/v2ray-agent/sing-box/sing-box ]] || return 1
+    read -r -p "Update sing-box core / 更新 sing-box 核心？[y/n]: " answer || return 1
+    [[ "$answer" == y ]] || return 0
+    agentInstallCore sing-box "" "${prereleaseStatus:-false}"
 }
 
 # Check wget showProgress
@@ -2625,81 +2938,34 @@ checkWgetShowProgress() {
 }
 # Install xray
 installXray() {
+    local answer preview=false
+    [[ "$2" != true ]] || preview=true
     readInstallType
-    local prereleaseStatus=false
-    if [[ "$2" == "true" ]]; then
-        prereleaseStatus=true
+    if [[ -e /etc/v2ray-agent/xray/xray ]]; then
+        [[ -z "${lastInstallationConfig}" ]] || return 0
+        read -r -p "Update Xray core / 更新 Xray 核心？[y/n]: " answer || return 1
+        [[ "$answer" == y ]] || return 0
     fi
-
-        echoContent skyBlue " ---> Number of days remaining on the certificate:${tlsStatus}"
-
-    if [[ ! -f "/etc/v2ray-agent/xray/xray" ]]; then
-        if [[ "${prereleaseStatus}" == "true" ]]; then
-            version=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
-        else
-            version=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-        fi
-
-        echoContent green " ---> Hysteria version:${version}"
-        if [[ "${release}" == "alpine" ]]; then
-            wget -c -q -P /etc/v2ray-agent/xray/ "https://github.com/XTLS/Xray-core/releases/download/${version}/${xrayCoreCPUVendor}.zip"
-        else
-            wget -c -q "${wgetShowProgressStatus}" -P /etc/v2ray-agent/xray/ "https://github.com/XTLS/Xray-core/releases/download/${version}/${xrayCoreCPUVendor}.zip"
-        fi
-
-        if [[ ! -f "/etc/v2ray-agent/xray/${xrayCoreCPUVendor}.zip" ]]; then
-            read -r -p "Core download failed. Retry installation? [y/n]" downloadStatus
-            if [[ "${downloadStatus}" == "y" ]]; then
-                installXray "$1"
-            fi
-        else
-            unzip -o "/etc/v2ray-agent/xray/${xrayCoreCPUVendor}.zip" -d /etc/v2ray-agent/xray >/dev/null
-            rm -rf "/etc/v2ray-agent/xray/${xrayCoreCPUVendor}.zip"
-
-            version=$(curl -s https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases?per_page=1 | jq -r '.[]|.tag_name')
-            echoContent skyBlue "------------------------Version-------------------------------"
-            echo "version:${version}"
-            rm /etc/v2ray-agent/xray/geo* >/dev/null 2>&1
-
-            if [[ "${release}" == "alpine" ]]; then
-                wget -c -q -P /etc/v2ray-agent/xray/ "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geosite.dat"
-                wget -c -q -P /etc/v2ray-agent/xray/ "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geoip.dat"
-            else
-                wget -c -q "${wgetShowProgressStatus}" -P /etc/v2ray-agent/xray/ "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geosite.dat"
-                wget -c -q "${wgetShowProgressStatus}" -P /etc/v2ray-agent/xray/ "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geoip.dat"
-            fi
-
-            chmod 655 /etc/v2ray-agent/xray/xray
-        fi
-    else
-        if [[ -z "${lastInstallationConfig}" ]]; then
-        echoContent green " ---> Hysteria version:$(/etc/v2ray-agent/hysteria/hysteria --version | awk '{print $3}')"
-        read -r -p "Would you like to update or upgrade? [y/n]:" reInstallXrayStatus
-            if [[ "${reInstallXrayStatus}" == "y" ]]; then
-                rm -f /etc/v2ray-agent/xray/xray
-                installXray "$1" "$2"
-            fi
-        fi
-    fi
+    agentInstallCore xray "" "$preview"
 }
 
 # xray version management
 xrayVersionManageMenu() {
-    echoContent skyBlue "\nProgress$1/${totalProgress}: Install V2Ray"
+    echoContent skyBlue "\nProgress $1/${totalProgress}: Xray core management"
     if [[ "${coreInstallType}" != "1" ]]; then
-            echoContent red " ---> Core download failed, please try installation again"
+        echoContent red " ---> No installed Xray core detected"
         exit 0
     fi
     echoContent red "\n=============================================================="
-            echoContent yellow " ---> Please refer to this tutorial for adding method, https://github.com/mack-a/v2ray-agent/blob/master/documents/dns_txt.md"
-            echoContent yellow " ---> Just like installing wildcard certificates on multiple machines with the same domain name, please add multiple TXT records. There is no need to modify the previously added TXT records."
-            echoContent yellow " ---> Please wait 1-2 minutes after the addition is completed"
-            echoContent yellow "\n ---> Port: ${port}"
-            echoContent yellow "Please enter the port [cannot be the same as the BT Panel port, press Enter to be random]"
-            echoContent yellow "Please enter the port [default: 443], you can customize the port [press Enter to use the default]"
-                echoContent yellow "\n ---> Port: ${port}"
-            echoContent yellow " ---> If the certificate has not expired or is customized, please select [n]\n"
-        echoContent yellow " ---> acme.sh is not installed"
+    echoContent yellow "1.Upgrade Xray-core (stable)"
+    echoContent yellow "2.Upgrade Xray-core (preview)"
+    echoContent yellow "3.Roll back Xray-core"
+    echoContent yellow "4.Stop Xray-core"
+    echoContent yellow "5.Start Xray-core"
+    echoContent yellow "6.Restart cores"
+    echoContent yellow "7.Update Geo data"
+    echoContent yellow "8.Schedule Geo updates"
+    echoContent yellow "9.View logs"
     echoContent red "=============================================================="
     read -r -p "Please select:" selectXrayType
     if [[ "${selectXrayType}" == "1" ]]; then
@@ -2709,20 +2975,9 @@ xrayVersionManageMenu() {
         prereleaseStatus=true
         updateXray
     elif [[ "${selectXrayType}" == "3" ]]; then
-        echoContent yellow "Please enter a custom path [eg: alone], no slash required, [Enter] random path"
-    echoContent yellow "\n path:${currentPath}"
-            echoContent yellow " ---> Regenerate certificate"
-        echoContent skyBlue "------------------------Version-------------------------------"
-        curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5" | jq -r ".[]|select (.prerelease==false)|.tag_name" | awk '{print ""NR""":"$0}'
-        echoContent skyBlue "--------------------------------------------------------------"
-        read -r -p "Please enter the version you want to roll back:" selectXrayVersionType
-        version=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5" | jq -r ".[]|select (.prerelease==false)|.tag_name" | awk '{print ""NR""":"$0}' | grep "${selectXrayVersionType}:" | awk -F "[:]" '{print $2}')
-        if [[ -n "${version}" ]]; then
-            updateXray "${version}"
-        else
-        echoContent red " ---> The installation directory is not detected, please execute the script to install the content"
-            xrayVersionManageMenu 1
-        fi
+        echoContent yellow "Rollback requires candidate configuration validation / 回退须通过候选配置校验。"
+        agentChooseCoreVersion xray || return 1
+        updateXray "$selectedCoreVersion"
     elif [[ "${selectXrayType}" == "4" ]]; then
         handleXray stop
     elif [[ "${selectXrayType}" == "5" ]]; then
@@ -2767,7 +3022,8 @@ agentGeoRecoveryClear() {
     done
 }
 agentDownloadGeo() {
-    local staging=$1 version name expected actual checksum
+    local staging=$1 binary=${2:-/etc/v2ray-agent/xray/xray} checkConfig=${3:-true}
+    local version name expected actual checksum
     local curlArgs=(--fail --silent --show-error --location --proto '=https' --proto-redir '=https'
                     --tlsv1.2 --connect-timeout 15 --max-time 120)
     curl "${curlArgs[@]}" https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest \
@@ -2790,10 +3046,12 @@ agentDownloadGeo() {
     # Exercise both databases even when the installed configuration does not use Geo.
     printf '%s\n' '{"outbounds":[{"protocol":"freedom","tag":"direct"}],"routing":{"rules":[{"type":"field","domain":["geosite:cn"],"outboundTag":"direct"},{"type":"field","ip":["geoip:cn"],"outboundTag":"direct"}]}}' \
         >"$staging/check.json" || return 1
-    timeout --kill-after=1s 20s env xray.location.asset="$staging" XRAY_LOCATION_ASSET="$staging" /etc/v2ray-agent/xray/xray \
+    timeout --kill-after=1s 20s env xray.location.asset="$staging" XRAY_LOCATION_ASSET="$staging" "$binary" \
         run -test -config "$staging/check.json" || return 1
-    timeout --kill-after=1s 20s env xray.location.asset="$staging" XRAY_LOCATION_ASSET="$staging" /etc/v2ray-agent/xray/xray \
-        run -test -confdir /etc/v2ray-agent/xray/conf || return 1
+    if [[ "$checkConfig" == true ]]; then
+        timeout --kill-after=1s 20s env xray.location.asset="$staging" XRAY_LOCATION_ASSET="$staging" "$binary" \
+            run -test -confdir /etc/v2ray-agent/xray/conf || return 1
+    fi
     printf '%s\n' "$version" >"$staging/version"
 }
 agentPublishGeo() {
@@ -2854,11 +3112,11 @@ updateGeoSite() {
     fi
     command -v timeout >/dev/null && command -v systemctl >/dev/null || return 1
     agentWriteLock || return 1
-    agentGeoRecoveryClear || return 1
+    agentManagedRecoveryClear && agentGeoRecoveryClear || return 1
     before=$(agentGeoDigest) || return 1
     staging=$(umask 077; mktemp -d /etc/v2ray-agent/xray/.geo-update.XXXXXXXX) || return 1
     if agentPrepare agentDownloadGeo "$staging" &&
-        agentGeoRecoveryClear &&
+        agentManagedRecoveryClear && agentGeoRecoveryClear &&
         after=$(agentGeoDigest) && [[ "$before" == "$after" ]] &&
         agentPublishGeo "$staging"; then
         echoContent green " ---> Geo files verified and Xray restart checked: $(<"$staging/version")"
@@ -2876,81 +3134,15 @@ updateGeoSite() {
 
 # Update Xray
 updateXray() {
+    local requested=${1:-} answer
     readInstallType
-
-    if [[ -z "${coreInstallType}" || "${coreInstallType}" != "1" ]]; then
-
-        if [[ "${prereleaseStatus}" == "true" ]]; then
-            version=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
-        else
-            version=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-        fi
-
-        if [[ -n "$1" ]]; then
-            version=$1
-        fi
-
-        echoContent green " ---> Tuic version:$(/etc/v2ray-agent/tuic/tuic -v)"
-
-        if [[ "${release}" == "alpine" ]]; then
-            wget -c -q -P /etc/v2ray-agent/xray/ "https://github.com/XTLS/Xray-core/releases/download/${version}/${xrayCoreCPUVendor}.zip"
-        else
-            wget -c -q "${wgetShowProgressStatus}" -P /etc/v2ray-agent/xray/ "https://github.com/XTLS/Xray-core/releases/download/${version}/${xrayCoreCPUVendor}.zip"
-        fi
-
-        unzip -o "/etc/v2ray-agent/xray/${xrayCoreCPUVendor}.zip" -d /etc/v2ray-agent/xray >/dev/null
-        rm -rf "/etc/v2ray-agent/xray/${xrayCoreCPUVendor}.zip"
-        chmod 655 /etc/v2ray-agent/xray/xray
-        handleXray stop
-        handleXray start
-    else
-        echoContent green " ---> Xray-core version:${version}"
-
-        if [[ "${prereleaseStatus}" == "true" ]]; then
-            remoteVersion=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
-        else
-            remoteVersion=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-        fi
-
-        echoContent green " ---> Xray-core version:$(/etc/v2ray-agent/xray/xray --version | awk '{print $2}' | head -1)"
-
-        if [[ -n "$1" ]]; then
-            version=$1
-        else
-            version=${remoteVersion}
-        fi
-
-        if [[ -n "$1" ]]; then
-            read -r -p "The rollback version is ${version}, do you want to continue? [y/n]:" rollbackXrayStatus
-            if [[ "${rollbackXrayStatus}" == "y" ]]; then
-    echoContent green " ---> Update completed"
-
-                handleXray stop
-                rm -f /etc/v2ray-agent/xray/xray
-                updateXray "${version}"
-            else
-        echoContent green " ---> v2ray-core version:${version}"
-            fi
-        elif [[ "${version}" == "v$(/etc/v2ray-agent/xray/xray --version | awk '{print $2}' | head -1)" ]]; then
-            read -r -p "The current version is the same as the latest version. Do you want to reinstall? [y/n]:" reInstallXrayStatus
-            if [[ "${reInstallXrayStatus}" == "y" ]]; then
-                handleXray stop
-                rm -f /etc/v2ray-agent/xray/xray
-                updateXray
-            else
-        echoContent green " ---> Current v2ray-core version: $(/etc/v2ray-agent/v2ray/v2ray --version | awk '{print $2}' | head -1)"
-            fi
-        else
-            read -r -p "The latest version is: ${version}, is it updated? [y/n]:" installXrayStatus
-            if [[ "${installXrayStatus}" == "y" ]]; then
-                rm /etc/v2ray-agent/xray/xray
-                updateXray
-            else
-                    echoContent green " ---> Current v2ray-core version: $(/etc/v2ray-agent/v2ray/v2ray --version | awk '{print $2}' | head -1)"
-            fi
-
-        fi
+    [[ -f /etc/v2ray-agent/xray/xray ]] || return 1
+    if [[ -n "$requested" ]]; then
+        [[ "$requested" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+([.-][A-Za-z0-9]+)*)?$ ]] || return 1
     fi
+    read -r -p "Update/reinstall Xray to ${requested:-selected release} / 更新或回退核心？[y/n]: " answer || return 1
+    [[ "$answer" == y ]] || return 0
+    agentInstallCore xray "$requested" "${prereleaseStatus:-false}"
 }
 
 # Verify that the entire service is available
@@ -4051,7 +4243,7 @@ singBoxTuicInstall() {
     fi
 
     totalProgress=5
-    installSingBox 1
+    installSingBox 1 || return 1
     selectCustomInstallType=",9,"
     initSingBoxConfig custom 2 true
     installSingBoxService 3
@@ -4066,7 +4258,7 @@ singBoxHysteria2Install() {
     fi
 
     totalProgress=5
-    installSingBox 1
+    installSingBox 1 || return 1
     selectCustomInstallType=",6,"
     initSingBoxConfig custom 2 true
     installSingBoxService 3
@@ -4076,95 +4268,108 @@ singBoxHysteria2Install() {
 
 # Initialize sing-box local DNS resolver
 initSingBoxLocalDNSConfig() {
-    local singBoxConfigDir="/etc/v2ray-agent/sing-box/conf/config"
-    local singBoxDNSConfigPath="${singBoxConfigDir}/dns.json"
-
-    mkdir -p "${singBoxConfigDir}"
-    if [[ -f "${singBoxDNSConfigPath}" ]] && jq empty "${singBoxDNSConfigPath}" >/dev/null 2>&1; then
+    local singBoxConfigDir=${1:-/etc/v2ray-agent/sing-box/conf/config}
+    local singBoxDNSConfigPath="$singBoxConfigDir/dns.json"
+    mkdir -p "$singBoxConfigDir" || return 1
+    if [[ -e "$singBoxDNSConfigPath" || -L "$singBoxDNSConfigPath" ]]; then
+        [[ -f "$singBoxDNSConfigPath" && ! -L "$singBoxDNSConfigPath" ]] || return 1
+        jq -es 'length == 1 and (.[0] | type == "object") and
+            (.[0].dns == null or (.[0].dns | type == "object")) and
+            (.[0].dns.servers == null or ((.[0].dns.servers | type == "array") and
+             all(.[0].dns.servers[]; type == "object")))' "$singBoxDNSConfigPath" >/dev/null || return 1
         jq '
-          . = (if type == "object" then . else {} end)
-          | .dns = (if (.dns | type) == "object" then .dns else {} end)
-          | .dns.servers = (if ((.dns.servers | type) == "array" and all(.dns.servers[]?; type == "object")) then .dns.servers else [] end)
-          | if any(.dns.servers[]?; .tag == "local") then .
-            elif any(.dns.servers[]?; .type == "local" and ((.tag // "") == "")) then
+          .dns = (.dns // {})
+          | .dns.servers = (.dns.servers // [])
+          | if any(.dns.servers[]; .tag == "local") then .
+            elif any(.dns.servers[]; .type == "local" and ((.tag // "") == "")) then
               .dns.servers |= map(if .type == "local" and ((.tag // "") == "") then .tag = "local" else . end)
-            else
-              .dns.servers += [{"tag": "local", "type": "local"}]
-            end
-        ' "${singBoxDNSConfigPath}" >"${singBoxDNSConfigPath}.tmp" && mv "${singBoxDNSConfigPath}.tmp" "${singBoxDNSConfigPath}"
+            else .dns.servers += [{"tag": "local", "type": "local"}] end
+        ' "$singBoxDNSConfigPath" >"$singBoxDNSConfigPath.tmp" || return 1
+        mv -fT -- "$singBoxDNSConfigPath.tmp" "$singBoxDNSConfigPath"
     else
-        cat <<EOF >"${singBoxDNSConfigPath}"
-{
-    "dns": {
-        "servers": [
-            {
-                "tag": "local",
-                "type": "local"
-            }
-        ]
-    }
-}
-EOF
+        (umask 077; printf '%s\n' '{"dns":{"servers":[{"tag":"local","type":"local"}]}}' >"$singBoxDNSConfigPath")
     fi
 }
 
 # Migrate outbound fragments generated by earlier script versions
 migrateSingBoxLegacyOutboundConfig() {
-    local singBoxConfigDir=${1:-/etc/v2ray-agent/sing-box/conf/config}
-    local outboundTag=
-    local outboundConfigPath=
-
-    for outboundTag in IPv4_out IPv6_out; do
-        outboundConfigPath="${singBoxConfigDir}/${outboundTag}.json"
-        if [[ -f "${outboundConfigPath}" ]] && jq -e 'any(.outbounds[]?; .type == "direct" and (.domain_strategy? != null))' "${outboundConfigPath}" >/dev/null 2>&1; then
-            jq '
-              .outbounds |= map(
-                if .type == "direct" and (.domain_strategy? != null) then
-                  .domain_resolver = {
-                    "server": "local",
-                    "strategy": .domain_strategy
-                  }
-                  | del(.domain_strategy)
-                else . end
-              )
-            ' "${outboundConfigPath}" >"${outboundConfigPath}.tmp" && mv "${outboundConfigPath}.tmp" "${outboundConfigPath}"
-        fi
+    local singBoxConfigDir=${1:-/etc/v2ray-agent/sing-box/conf/config} tag path
+    for tag in IPv4_out IPv6_out; do
+        path="$singBoxConfigDir/$tag.json"
+        [[ -e "$path" || -L "$path" ]] || continue
+        [[ -f "$path" && ! -L "$path" ]] || return 1
+        jq -es 'length == 1 and (.[0] | type == "object")' "$path" >/dev/null || return 1
+        jq '
+          if .outbounds == null then . else
+            .outbounds |= map(
+              if .type == "direct" and (.domain_strategy? != null) then
+                if .domain_resolver? != null then error("both legacy and modern domain resolver fields")
+                else .domain_resolver = {"server":"local", "strategy":.domain_strategy} | del(.domain_strategy) end
+              else . end)
+          end
+        ' "$path" >"$path.tmp" || return 1
+        mv -fT -- "$path.tmp" "$path" || return 1
     done
 }
 
 initSingBoxHTTPClientConfig() {
-    local singBoxConfigDir="/etc/v2ray-agent/sing-box/conf/config"
-
-    initSingBoxLocalDNSConfig
-    migrateSingBoxLegacyOutboundConfig
-    cat <<EOF >"${singBoxConfigDir}/00_http_clients.json"
-{
-  "http_clients": [
-    {
-      "tag": "rule_set_http"
-    }
-  ],
-  "route": {
-    "default_http_client": "rule_set_http"
-  }
-}
-EOF
-}
-
-singBoxMergeConfig() {
-    initSingBoxHTTPClientConfig || return 1
-    local candidate
-    candidate=$(mktemp /etc/v2ray-agent/sing-box/conf/.merged.XXXXXX) || return 1
-    if ! /etc/v2ray-agent/sing-box/sing-box merge "$candidate" \
-        -C /etc/v2ray-agent/sing-box/conf/config/ -D /etc/v2ray-agent/sing-box/conf/ \
-        >/dev/null 2>&1 || \
-        ! /etc/v2ray-agent/sing-box/sing-box check -c "$candidate" >/dev/null 2>&1; then
-        rm -f -- "$candidate"
-        echoContent red "sing-box merge/check failed; previous config retained. / 合并校验失败，已保留旧配置。"
-        return 1
+    local singBoxConfigDir=${1:-/etc/v2ray-agent/sing-box/conf/config}
+    initSingBoxLocalDNSConfig "$singBoxConfigDir" &&
+        migrateSingBoxLegacyOutboundConfig "$singBoxConfigDir" || return 1
+    # Preserve existing HTTP clients/defaults; candidate core checking decides compatibility.
+    if [[ -e "$singBoxConfigDir/00_http_clients.json" ]]; then
+        return 0
     fi
-    chmod 600 "$candidate" || { rm -f -- "$candidate"; return 1; }
-    mv -f -- "$candidate" /etc/v2ray-agent/sing-box/conf/config.json
+    (umask 077; printf '%s\n' '{"http_clients":[{"tag":"rule_set_http"}],"route":{"default_http_client":"rule_set_http"}}' \
+        >"$singBoxConfigDir/00_http_clients.json")
+}
+
+agentBuildSingBoxCandidate() {
+    (
+        umask 077
+        local staging=$1 binary=$2 path found=0
+        local source=/etc/v2ray-agent/sing-box/conf/config
+        [[ ! -L /etc/v2ray-agent/sing-box/conf && ! -L "$source" ]] || exit 1
+        mkdir -p "$staging/fragments" "$staging/data" || exit 1
+        for path in "$source/"*.json; do
+            [[ -e "$path" || -L "$path" ]] || continue
+            [[ -f "$path" && ! -L "$path" ]] || exit 1
+            jq -es 'length == 1 and (.[0] | type == "object")' "$path" >/dev/null || exit 1
+            cp -p -- "$path" "$staging/fragments/" || exit 1
+            found=1
+        done
+        if [[ "$found" == 1 ]]; then
+            # Compatibility conversion is private; original fragments are never rewritten.
+            initSingBoxHTTPClientConfig "$staging/fragments" || exit 1
+            timeout --kill-after=1s 20s "$binary" merge "$staging/config.json" \
+                -C "$staging/fragments" -D "$staging/data" || exit 1
+        elif [[ -e /etc/v2ray-agent/sing-box/conf/config.json || -L /etc/v2ray-agent/sing-box/conf/config.json ]]; then
+            [[ -f /etc/v2ray-agent/sing-box/conf/config.json && ! -L /etc/v2ray-agent/sing-box/conf/config.json ]] || exit 1
+            cp -p -- /etc/v2ray-agent/sing-box/conf/config.json "$staging/config.json" || exit 1
+        else
+            # Fresh binary installation: actual protocol configuration is created later.
+            exit 0
+        fi
+        jq -es 'length == 1 and (.[0] | type == "object")' "$staging/config.json" >/dev/null || exit 1
+        timeout --kill-after=1s 20s "$binary" check -c "$staging/config.json" -D "$staging/data" || exit 1
+        chmod 600 "$staging/config.json" || exit 1
+    )
+}
+singBoxMergeConfig() {
+    local staging before after result=1
+    agentWriteLock && agentManagedRecoveryClear || return 1
+    before=$(agentCoreDigest sing-box) || return 1
+    staging=$(umask 077; mktemp -d /etc/v2ray-agent/sing-box/conf/.merged-stage.XXXXXXXX) || return 1
+    if agentPrepare agentBuildSingBoxCandidate "$staging" /etc/v2ray-agent/sing-box/sing-box &&
+        after=$(agentCoreDigest sing-box) && [[ "$before" == "$after" ]] &&
+        agentManagedRecoveryClear && [[ -f "$staging/config.json" ]] &&
+        mv -fT -- "$staging/config.json" /etc/v2ray-agent/sing-box/conf/config.json; then
+        result=0
+    else
+        echoContent red "sing-box merge/check failed; previous config and all source fragments retained. / 合并校验失败，已保留旧配置和原始碎片。"
+    fi
+    rm -rf -- "$staging"
+    return "$result"
 }
 
 #initXrayFrontingConfig() {
@@ -7885,7 +8090,7 @@ socks5InboundRoutingMenu() {
     case ${selectType} in
     1)
         totalProgress=1
-        installSingBox 1
+        installSingBox 1 || return 1
         installSingBoxService 1
         setSocks5Inbound
         setSocks5InboundRouting
@@ -8772,7 +8977,7 @@ customSingBoxInstall() {
             handleNginx stop
         fi
 
-        installSingBox 4
+        installSingBox 4 || return 1
         installSingBoxService 5
         initSingBoxConfig custom 6
         cleanUp xrayDel
@@ -8798,7 +9003,7 @@ installXrayReality() {
 
     handleNginx stop
 
-    installXray 2 false
+    installXray 2 false || return 1
     installXrayService 3
     initXrayConfig custom 4
     cleanUp singBoxDel
@@ -8816,7 +9021,7 @@ installSingBoxReality() {
     totalProgress=6
     installTools 1
 
-    installSingBox 2
+    installSingBox 2 || return 1
     installSingBoxService 3
     initSingBoxConfig custom 4
     cleanUp xrayDel
@@ -8897,7 +9102,7 @@ customXrayInstall() {
         fi
 
         # Install Xray
-        installXray 7 false
+        installXray 7 false || return 1
         installXrayService 8
         initXrayConfig custom 9
         cleanUp singBoxDel
@@ -8976,7 +9181,7 @@ xrayCoreInstall() {
     randomPathFunction 5
 
     # Install Xray
-    installXray 6 false
+    installXray 6 false || return 1
     installXrayService 7
     initXrayConfig all 8
     cleanUp singBoxDel
@@ -9017,7 +9222,7 @@ singBoxInstall() {
 
     handleNginx stop
 
-    installSingBox 5
+    installSingBox 5 || return 1
     installSingBoxService 6
     initSingBoxConfig all 7
 
@@ -10406,28 +10611,28 @@ EOF
 }
 
 singBoxVersionManageMenu() {
-        echoContent skyBlue "\n================ Configure serverNames available to the client ================\n"
+    echoContent skyBlue "\n================ sing-box core management ================\n"
     if [[ -z "${singBoxConfigPath}" ]]; then
-        echoContent red " ---> Domain name cannot be empty"
+        echoContent red " ---> No installed sing-box configuration detected"
         menu
         exit 0
     fi
     echoContent red "\n=============================================================="
-        echoContent yellow "1.Installation"
-        echoContent yellow "1.Reinstall"
-        echoContent yellow "2.Uninstall"
-        echoContent yellow "3.core management"
+    echoContent yellow "1.Upgrade sing-box"
+    echoContent yellow "2.Stop sing-box"
+    echoContent yellow "3.Start sing-box"
+    echoContent yellow "4.Restart sing-box"
     echoContent yellow "=============================================================="
     local logStatus=
     if [[ -n "${singBoxConfigPath}" && -f "${singBoxConfigPath}log.json" && "$(jq -r .log.disabled "${singBoxConfigPath}log.json")" == "false" ]]; then
-        echoContent yellow "4.View log"
+        echoContent yellow "5.Disable logging"
         logStatus=true
     else
-        echoContent yellow "1.Installation"
+        echoContent yellow "5.Enable logging"
         logStatus=false
     fi
 
-    echoContent yellow "1.Upgrade Hysteria"
+    echoContent yellow "6.View log"
     echoContent red "=============================================================="
 
         read -r -p "Select:" selectSingBoxType
@@ -10435,9 +10640,7 @@ singBoxVersionManageMenu() {
         touch "${singBoxConfigPath}../box.log" >/dev/null 2>&1
     fi
     if [[ "${selectSingBoxType}" == "1" ]]; then
-        installSingBox 1
-        handleSingBox stop
-        handleSingBox start
+        updateSingBox || return 1
     elif [[ "${selectSingBoxType}" == "2" ]]; then
         handleSingBox stop
     elif [[ "${selectSingBoxType}" == "3" ]]; then
@@ -10458,7 +10661,7 @@ singBoxVersionManageMenu() {
 # main menu
 menu() {
     cd "$HOME" || exit
-    echoContent green "Current version: v3.5.24-port.4"
+    echoContent green "Current version: v3.5.24-port.5"
     echoContent red "\n=============================================================="
         echoContent green " ---> WARP offload uninstall successful"
         echoContent green " ---> Added shunt successfully"

@@ -40,6 +40,8 @@ class InstallerTests(unittest.TestCase):
         return subprocess.run(["bash", "-c", script], text=True, capture_output=True)
 
     def test_merge_failure_keeps_last_good_config(self):
+        if os.geteuid() != 0:
+            self.skipTest("installer explicitly requires root")
         for rel in ("install.sh", "shell/install_en.sh"):
             for fail_at in ("merge", "check", "none"):
                 with self.subTest(rel=rel, fail_at=fail_at):
@@ -47,19 +49,27 @@ class InstallerTests(unittest.TestCase):
                     conf = root / "sing-box/conf"
                     conf.mkdir(parents=True)
                     (conf / "config.json").write_text('{"original":true}\n')
+                    (conf / "config").mkdir()
+                    (conf / "config/base.json").write_text('{"original":true}\n')
                     binary = root / "sing-box/sing-box"
                     binary.write_text('#!/bin/bash\n'
                                       f'[[ "$1" == "{fail_at}" ]] && exit 1\n'
                                       'if [[ "$1" == "merge" ]]; then printf \'{"candidate":true}\\n\' > "$2"; fi\n'
                                       'exit 0\n')
                     binary.chmod(0o700)
-                    body = function((REPO / rel).read_text(), "singBoxMergeConfig")
-                    body = body.replace("/etc/v2ray-agent", str(root))
+                    source = (REPO / rel).read_text()
+                    body = "\n".join(function(source, name) for name in (
+                        "agentWriteLock", "agentWriteUnlock", "agentConfigDigest", "agentPreparationDigest",
+                        "agentPrepare", "agentManagedRecoveryClear", "agentCoreDigest",
+                        "agentBuildSingBoxCandidate", "singBoxMergeConfig"))
+                    body = body.replace("/etc/v2ray-agent", str(root)).replace("/etc/nginx/conf.d", str(root / "nginx"))
+                    body = body.replace("/etc/systemd/system", str(root / "systemd"))
                     result = self.execute('echoContent() { :; }; initSingBoxHTTPClientConfig() { :; };\n' + body + '\nsingBoxMergeConfig')
                     self.assertEqual(result.returncode, 0 if fail_at == "none" else 1, result.stderr)
                     expected = '{"candidate":true}\n' if fail_at == "none" else '{"original":true}\n'
                     self.assertEqual((conf / "config.json").read_text(), expected)
-                    self.assertEqual(list(conf.glob(".merged.*")), [])
+                    self.assertEqual((conf / "config/base.json").read_text(), '{"original":true}\n')
+                    self.assertEqual(list(conf.glob(".merged-stage.*")), [])
 
     def test_input_releases_shared_lock_and_refuses_stale_config(self):
         if os.geteuid() != 0:
