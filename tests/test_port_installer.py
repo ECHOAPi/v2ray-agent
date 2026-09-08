@@ -103,15 +103,22 @@ class InstallerTests(unittest.TestCase):
                 proc.communicate()
 
     def test_failed_update_preserves_script(self):
+        if os.geteuid() != 0:
+            self.skipTest("installer explicitly requires root")
         for rel in ("install.sh", "shell/install_en.sh"):
             with self.subTest(rel=rel):
                 root = self.root / rel.replace("/", "_")
                 root.mkdir()
                 previous = root / "install.sh"
                 previous.write_text("original script\n")
-                body = function((REPO / rel).read_text(), "updateV2RayAgent").replace("/etc/v2ray-agent", str(root))
-                result = self.execute('echoContent() { :; }; curl() { return 22; };\n' + body + '\nupdateV2RayAgent')
+                source = (REPO / rel).read_text()
+                body = "\n".join(function(source, name) for name in (
+                    "agentWriteLock", "agentWriteUnlock", "agentConfigDigest", "agentPreparationDigest",
+                    "agentPrepare", "agentDownloadScript", "updateV2RayAgent"))
+                body = body.replace("/etc/v2ray-agent", str(root)).replace("/etc/nginx/conf.d", str(root / "nginx"))
+                result = self.execute('echoContent() { :; }; curl() { echo DOWNLOAD_FAILED >&2; return 22; };\n' + body + '\nupdateV2RayAgent')
                 self.assertNotEqual(result.returncode, 0)
+                self.assertIn("DOWNLOAD_FAILED", result.stderr)
                 self.assertEqual(previous.read_text(), "original script\n")
                 self.assertEqual(list(root.glob(".install.*")), [])
 
@@ -280,7 +287,10 @@ echo CONTINUED
                     for fmt in ("default", "clashMeta", "clashMetaProfiles", "sing-box", "sing-box_profiles"):
                         (root / parent / fmt).mkdir(parents=True)
                 (root / "subscribe_local/subscribeSalt").write_text("test-salt\n")
-                body = function((REPO / rel).read_text(), "subscribe").replace("/etc/v2ray-agent", str(root))
+                source = (REPO / rel).read_text()
+                body = '\n'.join(function(source, name) for name in
+                                 ("agentGenerateSubscriptions", "agentPublishSubscriptions", "subscribe"))
+                body = body.replace("/etc/v2ray-agent", str(root))
                 setup = r'''
 readInstallProtocolType() { :; }
 installSubscribe() { :; }
@@ -291,7 +301,7 @@ showAccounts() {
   printf '  - {name: user, type: vless, port: 443}\n' >ROOT/subscribe_local/clashMeta/user
   printf '[{"tag":"user","type":"vless","server_port":443}]' >ROOT/subscribe_local/sing-box/user
 }
-clashMetaConfig() { printf 'generated' >"ROOT/subscribe/clashMetaProfiles/$2"; }
+clashMetaConfig() { printf 'generated' >"${subscriptionOutputRoot}/clashMetaProfiles/$2"; }
 wget() { printf '{"outbounds":[{"tag":"select","outbounds":[]}]}' >"$2"; }
 coreInstallType=1
 subscribeType=https
