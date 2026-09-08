@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Port management package is fetched at one immutable source revision.
-PORT_MANAGER_REVISION="PM_REVISION_PENDING"
+PORT_MANAGER_REVISION="697109bab5f94610069e98cda81e1dd23a72a547"
 PORT_MANAGER_LANGUAGE="en"
 PORT_MANAGER_SOURCE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
